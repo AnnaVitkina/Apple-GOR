@@ -19,7 +19,8 @@ Usage (Google Colab):
   sys.path.insert(0, "/content/Apple-GOR")
   exec(open("/content/Apple-GOR/run_pipeline.py").read())
 
-  # Data folders on Google Drive are auto-detected. To override:
+  # Interactive prompts are kept by default in Colab.
+  # Set os.environ["GOR_AUTO"] = "1" only if you want to skip prompts.
   # import os
   # os.environ["GOR_DRIVE_BASE"] = "/content/drive/.../RMT_GOR"
   # os.environ["GOR_INPUT_DIR"] = ".../input"
@@ -181,16 +182,11 @@ def _running_in_notebook() -> bool:
     return "ipykernel" in sys.modules or "IPython" in sys.modules
 
 
-def _should_auto_run() -> bool:
-    if _env_flag("GOR_NO_AUTO"):
-        return False
-    return _env_flag("GOR_AUTO") or _running_in_notebook()
-
-
 if __name__ == "__main__":
-    if _should_auto_run():
+    if _running_in_notebook():
+        # Skip argparse in Colab/Jupyter (kernel passes -f ...json), keep prompts.
         run_pipeline(
-            auto=True,
+            auto=_env_flag("GOR_AUTO"),
             convert_only=_env_flag("GOR_CONVERT_ONLY"),
             matrix_only=_env_flag("GOR_MATRIX_ONLY"),
         )
