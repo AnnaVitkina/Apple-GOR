@@ -35,6 +35,9 @@ HEADER_MARKERS = (
 )
 
 SECTION_TITLE_PATTERN = re.compile(r"gor25\s+.+\s+common\s+rating", re.IGNORECASE)
+VALUE_HEADER_PATTERN = re.compile(r"^Value\s*\(([^)]+)\)\s*$", re.IGNORECASE)
+VALID_FROM_COLUMN = "Valid From"
+VALID_TO_COLUMN = "Valid To"
 
 
 @dataclass(frozen=True)
@@ -345,6 +348,97 @@ def _row_contains_marker(row: pd.Series) -> bool:
     return any(marker in texts for marker in HEADER_MARKERS)
 
 
+def _extract_per_column_validity(
+    df_raw: pd.DataFrame,
+    header_row_idx: int,
+) -> dict[int, tuple[object, object]]:
+    """Map raw column index to (valid_from, valid_to) from header rows above the table."""
+    from_row_idx: int | None = None
+    to_row_idx: int | None = None
+
+    for row_idx in range(header_row_idx):
+        row = df_raw.iloc[row_idx]
+        for value in row:
+            lower = _cell_text(value).lower()
+            if lower.startswith("from (yy"):
+                from_row_idx = row_idx
+            elif lower.startswith("to (yy"):
+                to_row_idx = row_idx
+
+    if from_row_idx is None or to_row_idx is None:
+        return {}
+
+    from_row = df_raw.iloc[from_row_idx]
+    to_row = df_raw.iloc[to_row_idx]
+    mapping: dict[int, tuple[object, object]] = {}
+    for col_idx in range(min(len(from_row), len(to_row))):
+        valid_from = from_row.iloc[col_idx]
+        valid_to = to_row.iloc[col_idx]
+        if pd.isna(valid_from) or pd.isna(valid_to):
+            continue
+        if _cell_text(valid_from).lower().startswith("from"):
+            continue
+        mapping[col_idx] = (valid_from, valid_to)
+    return mapping
+
+
+def _apply_internal_value_headers(headers: list[str], internal_row: pd.Series) -> list[str]:
+    """Replace display headers like 'GOR Year' with internal names like 'Value (USD)'."""
+    updated = list(headers)
+    value_count = 0
+
+    for col_idx, header in enumerate(updated):
+        if col_idx >= len(internal_row):
+            continue
+        internal_name = _cell_text(internal_row.iloc[col_idx])
+        if not VALUE_HEADER_PATTERN.match(internal_name):
+            continue
+        value_count += 1
+        updated[col_idx] = internal_name if value_count == 1 else f"{internal_name}_{value_count}"
+
+    return updated
+
+
+def _is_value_header_name(header_name: str) -> bool:
+    text = _cell_text(header_name)
+    return bool(VALUE_HEADER_PATTERN.match(text) or re.match(r"^Value\s*\([^)]+\)_\d+$", text, re.I))
+
+
+def _attach_per_value_column_validity(
+    df: pd.DataFrame,
+    *,
+    headers: list[str],
+    per_column_validity: dict[int, tuple[object, object]],
+    metadata: SheetMetadata,
+) -> pd.DataFrame:
+    value_column_indices = [
+        col_idx for col_idx, header in enumerate(headers) if _is_value_header_name(header)
+    ]
+    if len(value_column_indices) <= 1:
+        return _attach_validity_columns(df, metadata)
+
+    enriched = df.copy()
+    validity_frame: dict[str, object] = {}
+
+    for value_idx, col_idx in enumerate(value_column_indices):
+        header_name = headers[col_idx]
+        if header_name not in enriched.columns:
+            continue
+        suffix = "" if value_idx == 0 else f"_{value_idx + 1}"
+        valid_from, valid_to = per_column_validity.get(
+            col_idx,
+            (metadata.valid_from, metadata.valid_to),
+        )
+        validity_frame[f"{VALID_FROM_COLUMN}{suffix}"] = _format_metadata_date(valid_from)
+        validity_frame[f"{VALID_TO_COLUMN}{suffix}"] = _format_metadata_date(valid_to)
+
+    if not validity_frame:
+        return _attach_validity_columns(df, metadata)
+
+    validity_df = pd.DataFrame({column: [value] * len(enriched) for column, value in validity_frame.items()})
+    return pd.concat([validity_df, enriched], axis=1)
+
+
 def _attach_validity_columns(df: pd.DataFrame, metadata: SheetMetadata) -> pd.DataFrame:
     if metadata.valid_from is None and metadata.valid_to is None:
         return df
@@ -415,8 +509,10 @@ def clean_standard_tab_df(df_raw: pd.DataFrame, metadata: SheetMetadata) -> pd.D
         return _attach_validity_columns(cleaned, metadata)
 
     headers = _normalize_headers(df_raw.iloc[header_row_idx].tolist())
+    per_column_validity = _extract_per_column_validity(df_raw, header_row_idx)
     data_start = header_row_idx + 1
     if data_start < len(df_raw) and _is_internal_field_row(df_raw.iloc[data_start]):
+        headers = _apply_internal_value_headers(headers, df_raw.iloc[data_start])
         data_start += 1
 
     df = df_raw.iloc[data_start:].copy()
@@ -424,6 +520,13 @@ def clean_standard_tab_df(df_raw: pd.DataFrame, metadata: SheetMetadata) -> pd.D
     df = _drop_empty_rows(df)
     df = _drop_empty_columns(df)
     df = df.reset_index(drop=True)
+    if len([header for header in headers if _is_value_header_name(header)]) > 1:
+        return _attach_per_value_column_validity(
+            df,
+            headers=headers,
+            per_column_validity=per_column_validity,
+            metadata=metadata,
+        )
     return _attach_validity_columns(df, metadata)
 
 
