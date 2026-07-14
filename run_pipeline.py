@@ -14,23 +14,17 @@ Usage (local):
   python run_pipeline.py --matrix-only
 
 Usage (Google Colab):
-  import os
   import sys
 
-  CODE_DIR = "/content/Apple-GOR"
-  DRIVE_BASE = (
-      "/content/drive/Shareddrives/FA Ops Europe: Rate Maintenance Team "
-      "/Documents/AI Adoption RMT/RMT_Apple/RMT_GOR"
-  )
+  sys.path.insert(0, "/content/Apple-GOR")
+  exec(open("/content/Apple-GOR/run_pipeline.py").read())
 
-  sys.path.insert(0, CODE_DIR)
-  os.environ["GOR_ROOT"] = CODE_DIR
-  os.environ["GOR_INPUT_DIR"] = f"{DRIVE_BASE}/input"
-  os.environ["GOR_PROCESSING_DIR"] = f"{DRIVE_BASE}/processing"
-  os.environ["GOR_OUTPUT_DIR"] = f"{DRIVE_BASE}/output"
-
-  exec(open(f"{CODE_DIR}/run_pipeline.py").read())
-  # Notebook/Colab is auto-detected; GOR_AUTO is optional.
+  # Data folders on Google Drive are auto-detected. To override:
+  # import os
+  # os.environ["GOR_DRIVE_BASE"] = "/content/drive/.../RMT_GOR"
+  # os.environ["GOR_INPUT_DIR"] = ".../input"
+  # os.environ["GOR_PROCESSING_DIR"] = ".../processing"
+  # os.environ["GOR_OUTPUT_DIR"] = ".../output"
 """
 
 from __future__ import annotations
@@ -49,18 +43,28 @@ except NameError:
 if str(_CODE_DIR) not in sys.path:
     sys.path.insert(0, str(_CODE_DIR))
 
-from project_paths import configure_paths_from_env, print_path_config
-
-configure_paths_from_env()
-
-# Re-import pipeline modules so they pick up configured Drive paths on repeat exec().
-for _module_name in (
+_PIPELINE_MODULES = (
+    "project_paths",
     "build_matrix",
     "build_conditions",
     "build_postal_code_zones",
     "convert_to_processing",
-):
-    sys.modules.pop(_module_name, None)
+)
+
+
+def _bootstrap_paths() -> None:
+    for module_name in _PIPELINE_MODULES:
+        sys.modules.pop(module_name, None)
+
+    import project_paths
+
+    project_paths.configure_paths_from_env()
+    return project_paths
+
+
+_project_paths = _bootstrap_paths()
+configure_paths_from_env = _project_paths.configure_paths_from_env
+print_path_config = _project_paths.print_path_config
 
 from build_matrix import run_build_matrix
 from convert_to_processing import run_convert
