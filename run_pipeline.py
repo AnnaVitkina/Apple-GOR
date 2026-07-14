@@ -28,9 +28,9 @@ Usage (Google Colab):
   os.environ["GOR_INPUT_DIR"] = f"{DRIVE_BASE}/input"
   os.environ["GOR_PROCESSING_DIR"] = f"{DRIVE_BASE}/processing"
   os.environ["GOR_OUTPUT_DIR"] = f"{DRIVE_BASE}/output"
-  os.environ["GOR_AUTO"] = "1"
 
   exec(open(f"{CODE_DIR}/run_pipeline.py").read())
+  # Notebook/Colab is auto-detected; GOR_AUTO is optional.
 """
 
 from __future__ import annotations
@@ -168,8 +168,23 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _running_in_notebook() -> bool:
+    """True in Colab/Jupyter where sys.argv contains kernel launcher flags."""
+    if "colab_kernel_launcher" in Path(sys.argv[0]).name:
+        return True
+    if any(arg == "-f" for arg in sys.argv):
+        return True
+    return "ipykernel" in sys.modules or "IPython" in sys.modules
+
+
+def _should_auto_run() -> bool:
+    if _env_flag("GOR_NO_AUTO"):
+        return False
+    return _env_flag("GOR_AUTO") or _running_in_notebook()
+
+
 if __name__ == "__main__":
-    if _env_flag("GOR_AUTO"):
+    if _should_auto_run():
         run_pipeline(
             auto=True,
             convert_only=_env_flag("GOR_CONVERT_ONLY"),
