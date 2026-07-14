@@ -14,7 +14,12 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
 
-from build_matrix import DATA_START_ROW, SHIPMENT_COLUMNS, cell_text
+from build_matrix import (
+    DATA_START_ROW,
+    ORIGIN_CITY_LABEL_COLUMN,
+    SHIPMENT_COLUMNS,
+    cell_text,
+)
 from country_codes import to_country_iso
 from project_paths import OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs
 from us_ca_city_states import format_us_ca_postal_city
@@ -25,12 +30,13 @@ DESTINATION_COMMON_RATING_SECTION = "GOR25 Destination Common Rating"
 POSTAL_ZONE_COLUMNS = ("Name", "Country", "Postal Code", "Excluded")
 POSTAL_CODE_ZONES_SUFFIX = "_postal_code_zones.txt"
 
-DESTINATION_HIGHLIGHT_FILL = PatternFill("solid", fgColor="DAEEF3")
-DESTINATION_HIGHLIGHT_FONT = Font(underline="single", bold=True)
+CITY_HIGHLIGHT_FILL = PatternFill("solid", fgColor="DAEEF3")
+CITY_HIGHLIGHT_FONT = Font(underline="single", bold=True)
 
 DESTINATION_RAW_COLUMN = "Destination City"
 DESTINATION_LABEL_COLUMN = "Destination City "
 DESTINATION_LABEL_SUFFIX = " (Destination)"
+ORIGIN_LABEL_SUFFIX = " (Origin)"
 
 
 @dataclass(frozen=True)
@@ -142,15 +148,19 @@ def build_postal_code_zones(additional_info_df: pd.DataFrame) -> list[PostalCode
     return zones
 
 
-def _base_city_from_destination_label(label: str) -> str:
+def _base_city_from_label(label: str, suffix: str) -> str:
     text = cell_text(label)
-    if text.endswith(DESTINATION_LABEL_SUFFIX):
-        return text[: -len(DESTINATION_LABEL_SUFFIX)].strip()
+    if text.endswith(suffix):
+        return text[: -len(suffix)].strip()
     return text
 
 
-def matrix_destination_labels(matrix_df: pd.DataFrame) -> list[tuple[str, str]]:
-    """Return unique (Destination City label, country) pairs from the matrix."""
+def _matrix_city_labels(
+    matrix_df: pd.DataFrame,
+    *,
+    label_column: str,
+    country_column: str,
+) -> list[tuple[str, str]]:
     seen: set[str] = set()
     results: list[tuple[str, str]] = []
 
@@ -158,8 +168,8 @@ def matrix_destination_labels(matrix_df: pd.DataFrame) -> list[tuple[str, str]]:
         if cell_text(row.get("Service Type")) == "SPECIAL":
             continue
 
-        label = cell_text(row.get(DESTINATION_LABEL_COLUMN))
-        country = _normalize_country(row.get("Destination Country"))
+        label = cell_text(row.get(label_column))
+        country = _normalize_country(row.get(country_column))
         if not label or not country:
             continue
 
@@ -172,39 +182,94 @@ def matrix_destination_labels(matrix_df: pd.DataFrame) -> list[tuple[str, str]]:
     return results
 
 
-def build_final_postal_zones(
-    additional_info_df: pd.DataFrame,
-    matrix_df: pd.DataFrame,
-) -> list[PostalCodeZone]:
-    all_zones = build_postal_code_zones(additional_info_df)
-    zones_by_name = {zone.name: zone for zone in all_zones}
+def matrix_destination_labels(matrix_df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Return unique (Destination City label, country) pairs from the matrix."""
+    return _matrix_city_labels(
+        matrix_df,
+        label_column=DESTINATION_LABEL_COLUMN,
+        country_column="Destination Country",
+    )
 
-    destination_zones: list[PostalCodeZone] = []
-    for label, country in matrix_destination_labels(matrix_df):
+
+def matrix_origin_labels(matrix_df: pd.DataFrame) -> list[tuple[str, str]]:
+    """Return unique (Origin City label, country) pairs from the matrix."""
+    return _matrix_city_labels(
+        matrix_df,
+        label_column=ORIGIN_CITY_LABEL_COLUMN,
+        country_column="Origin Country",
+    )
+
+
+def _append_matrix_city_zones(
+    matrix_labels: list[tuple[str, str]],
+    *,
+    zones_by_name: dict[str, PostalCodeZone],
+    label_suffix: str,
+) -> list[PostalCodeZone]:
+    city_zones: list[PostalCodeZone] = []
+    for label, country in matrix_labels:
         if label in zones_by_name:
-            destination_zones.append(zones_by_name[label])
+            city_zones.append(zones_by_name[label])
             continue
 
-        base_city = _base_city_from_destination_label(label)
+        base_city = _base_city_from_label(label, label_suffix)
         postal_code = (
             format_us_ca_postal_city(base_city, country, base_city)
             if country in {"US", "CA"}
             else base_city
         )
-        destination_zones.append(
+        city_zones.append(
             PostalCodeZone(
                 name=label,
                 country=country,
                 postal_code=postal_code,
             )
         )
+    return city_zones
 
-    destination_zones.sort(key=lambda zone: (zone.country, zone.name.casefold()))
-    return destination_zones
+
+def build_final_postal_zones(
+    additional_info_df: pd.DataFrame,
+    matrix_df: pd.DataFrame,
+    *,
+    include_origin_city: bool = False,
+) -> list[PostalCodeZone]:
+    all_zones = build_postal_code_zones(additional_info_df)
+    zones_by_name = {zone.name: zone for zone in all_zones}
+
+    final_zones: list[PostalCodeZone] = []
+    if include_origin_city:
+        final_zones.extend(
+            _append_matrix_city_zones(
+                matrix_origin_labels(matrix_df),
+                zones_by_name=zones_by_name,
+                label_suffix=ORIGIN_LABEL_SUFFIX,
+            )
+        )
+
+    final_zones.extend(
+        _append_matrix_city_zones(
+            matrix_destination_labels(matrix_df),
+            zones_by_name=zones_by_name,
+            label_suffix=DESTINATION_LABEL_SUFFIX,
+        )
+    )
+
+    final_zones.sort(key=lambda zone: (zone.country, zone.name.casefold()))
+    return final_zones
+
+
+def zone_names_for_suffix(zones: list[PostalCodeZone], suffix: str) -> set[str]:
+    wrapped_suffix = f"({suffix})"
+    return {zone.name for zone in zones if zone.name.endswith(wrapped_suffix)}
 
 
 def destination_zone_names(zones: list[PostalCodeZone]) -> set[str]:
-    return {zone.name for zone in zones if zone.name.endswith("(Destination)")}
+    return zone_names_for_suffix(zones, "Destination")
+
+
+def origin_zone_names(zones: list[PostalCodeZone]) -> set[str]:
+    return zone_names_for_suffix(zones, "Origin")
 
 
 def write_postal_code_zones_txt(zones: list[PostalCodeZone], output_path: Path) -> Path:
@@ -215,34 +280,70 @@ def write_postal_code_zones_txt(zones: list[PostalCodeZone], output_path: Path) 
     return output_path
 
 
-def _second_destination_city_column_index() -> int:
-    return SHIPMENT_COLUMNS.index(DESTINATION_LABEL_COLUMN) + 1
+def _city_column_index(column_name: str) -> int:
+    return SHIPMENT_COLUMNS.index(column_name) + 1
+
+
+def highlight_labeled_city_column(
+    worksheet,
+    *,
+    column_name: str,
+    zone_names_set: set[str],
+) -> int:
+    if not zone_names_set or column_name not in SHIPMENT_COLUMNS:
+        return 0
+
+    col_index = _city_column_index(column_name)
+    highlighted = 0
+
+    for row_index in range(DATA_START_ROW, worksheet.max_row + 1):
+        cell = worksheet.cell(row_index, col_index)
+        value = cell_text(cell.value)
+        if not value or value not in zone_names_set:
+            continue
+
+        cell.fill = CITY_HIGHLIGHT_FILL
+        cell.font = CITY_HIGHLIGHT_FONT
+        highlighted += 1
+
+    return highlighted
+
+
+def highlight_city_labels_in_matrix(
+    matrix_path: Path,
+    *,
+    destination_zone_names_set: set[str],
+    origin_zone_names_set: set[str] | None = None,
+) -> tuple[int, int]:
+    workbook = load_workbook(matrix_path)
+    worksheet = workbook["Rate card"]
+
+    destination_highlighted = highlight_labeled_city_column(
+        worksheet,
+        column_name=DESTINATION_LABEL_COLUMN,
+        zone_names_set=destination_zone_names_set,
+    )
+    origin_highlighted = 0
+    if origin_zone_names_set:
+        origin_highlighted = highlight_labeled_city_column(
+            worksheet,
+            column_name=ORIGIN_CITY_LABEL_COLUMN,
+            zone_names_set=origin_zone_names_set,
+        )
+
+    workbook.save(matrix_path)
+    return destination_highlighted, origin_highlighted
 
 
 def highlight_destination_cities_in_matrix(
     matrix_path: Path,
     destination_zone_names_set: set[str],
 ) -> int:
-    if not destination_zone_names_set:
-        return 0
-
-    workbook = load_workbook(matrix_path)
-    worksheet = workbook["Rate card"]
-    col_index = _second_destination_city_column_index()
-    highlighted = 0
-
-    for row_index in range(DATA_START_ROW, worksheet.max_row + 1):
-        cell = worksheet.cell(row_index, col_index)
-        value = cell_text(cell.value)
-        if not value or value not in destination_zone_names_set:
-            continue
-
-        cell.fill = DESTINATION_HIGHLIGHT_FILL
-        cell.font = DESTINATION_HIGHLIGHT_FONT
-        highlighted += 1
-
-    workbook.save(matrix_path)
-    return highlighted
+    destination_highlighted, _ = highlight_city_labels_in_matrix(
+        matrix_path,
+        destination_zone_names_set=destination_zone_names_set,
+    )
+    return destination_highlighted
 
 
 def default_postal_zones_path(source_file: Path) -> Path:
@@ -256,17 +357,27 @@ def apply_postal_code_zones(
     matrix_path: Path,
     matrix_df: pd.DataFrame,
     output_path: Path | None = None,
-) -> tuple[Path, int, int, int]:
+    include_origin_city: bool = False,
+) -> tuple[Path, int, int, int, int]:
     additional_info_df = load_additional_info(source_file)
     all_zones = build_postal_code_zones(additional_info_df)
-    final_zones = build_final_postal_zones(additional_info_df, matrix_df)
+    final_zones = build_final_postal_zones(
+        additional_info_df,
+        matrix_df,
+        include_origin_city=include_origin_city,
+    )
 
     txt_path = output_path or default_postal_zones_path(source_file)
     write_postal_code_zones_txt(final_zones, txt_path)
 
-    highlight_names = destination_zone_names(final_zones)
-    highlighted = highlight_destination_cities_in_matrix(matrix_path, highlight_names)
-    return txt_path, len(final_zones), len(all_zones), highlighted
+    destination_names = destination_zone_names(final_zones)
+    origin_names = origin_zone_names(final_zones) if include_origin_city else set()
+    destination_highlighted, origin_highlighted = highlight_city_labels_in_matrix(
+        matrix_path,
+        destination_zone_names_set=destination_names,
+        origin_zone_names_set=origin_names if include_origin_city else None,
+    )
+    return txt_path, len(final_zones), len(all_zones), destination_highlighted, origin_highlighted
 
 
 def run_build_postal_code_zones(
@@ -275,15 +386,19 @@ def run_build_postal_code_zones(
     matrix_path: Path,
     matrix_df: pd.DataFrame,
     output_path: Path | None = None,
+    include_origin_city: bool = False,
 ) -> Path:
-    txt_path, used_count, total_count, highlighted = apply_postal_code_zones(
+    txt_path, used_count, total_count, destination_highlighted, origin_highlighted = apply_postal_code_zones(
         source_file=source_file,
         matrix_path=matrix_path,
         matrix_df=matrix_df,
         output_path=output_path,
+        include_origin_city=include_origin_city,
     )
     print(f"  Wrote {used_count} postal code zone(s) from {total_count} common-rating zone(s)")
-    print(f"  Highlighted {highlighted} destination label cell(s) in matrix")
+    print(f"  Highlighted {destination_highlighted} destination label cell(s) in matrix")
+    if include_origin_city:
+        print(f"  Highlighted {origin_highlighted} origin label cell(s) in matrix")
     print(f"  Saved postal code zones to: {txt_path}")
     return txt_path
 
