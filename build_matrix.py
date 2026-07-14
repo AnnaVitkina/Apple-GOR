@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +19,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from convert_to_processing import ask_yes_no
 from country_codes import to_country_iso
 from project_paths import OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs
 
@@ -35,9 +38,17 @@ SERVICE_FEE_ACCESSORIAL_COLUMN = "Accessorial Description"
 SERVICE_FEE_ORIGINS_COLUMN = "Origins"
 SERVICE_FEE_RATE_BASIS_COLUMN = "Rate Basis"
 
-VALUE_COLUMN_PATTERN = re.compile(r"^Value\s*\(([^)]+)\)\s*$", re.IGNORECASE)
+VALUE_COLUMN_PATTERN = re.compile(r"^Value\s*\(([^)]+)\)(?:_\d+)?\s*$", re.IGNORECASE)
+VALID_FROM_COLUMN = "Valid From"
+VALID_TO_COLUMN = "Valid To"
+CURRENCY_COLUMN = "Currency"
 EXACT_CONTAINER_RATE_BASIS_PATTERN = re.compile(
     r"^\d+(?:RE|HCRE|HC|CN|CZ|HV)(?:/\d+(?:RE|HCRE|HC|CN|CZ|HV))*$",
+    re.IGNORECASE,
+)
+GENERIC_CONTAINER_RATE_BASIS_PATTERN = re.compile(r"container", re.IGNORECASE)
+CONTAINER_SIZE_BASIS_PATTERN = re.compile(
+    r"\d+\s*['\u2019]?\s*container",
     re.IGNORECASE,
 )
 RATE_BASIS_SEGMENT_PATTERN = re.compile(r"^(\d+)(RE|HCRE|HC|CN|CZ|HV)$", re.IGNORECASE)
@@ -57,13 +68,22 @@ EQUIPMENT_SORT_ORDER = (
     "40' HC Reefer",
 )
 
-SHIPMENT_COLUMNS = (
+ORIGIN_CITY_RAW_COLUMN = "Origin City"
+ORIGIN_CITY_LABEL_COLUMN = "Origin City "
+
+_SHIPMENT_COLUMNS_PREFIX = (
     "Lane #",
     "Tab",
     "Service Type",
     "Origin Country",
     "Port of Loading",
     "Port of Loading ",
+)
+_SHIPMENT_COLUMNS_ORIGIN_CITY = (
+    ORIGIN_CITY_RAW_COLUMN,
+    ORIGIN_CITY_LABEL_COLUMN,
+)
+_SHIPMENT_COLUMNS_SUFFIX = (
     "Destination Country",
     "Port of Entry",
     "Port of Entry ",
@@ -71,6 +91,42 @@ SHIPMENT_COLUMNS = (
     "Destination City ",
     "Equipment Type",
 )
+
+SHIPMENT_COLUMNS = _SHIPMENT_COLUMNS_PREFIX + _SHIPMENT_COLUMNS_SUFFIX
+
+_LANE_IDENTITY_COLUMNS_BASE = (
+    "Service Type",
+    "Origin Country",
+    "Port of Loading",
+    "Port of Loading ",
+    "Port of Entry",
+    "Port of Entry ",
+    "Destination City",
+    "Equipment Type",
+)
+LANE_IDENTITY_COLUMNS = _LANE_IDENTITY_COLUMNS_BASE
+
+
+def includes_origin_city_columns() -> bool:
+    return ORIGIN_CITY_LABEL_COLUMN in SHIPMENT_COLUMNS
+
+
+def set_include_origin_city(include: bool) -> tuple[str, ...]:
+    """Configure active shipment columns and lane identity for optional Origin City."""
+    global SHIPMENT_COLUMNS, LANE_IDENTITY_COLUMNS
+
+    if include:
+        SHIPMENT_COLUMNS = _SHIPMENT_COLUMNS_PREFIX + _SHIPMENT_COLUMNS_ORIGIN_CITY + _SHIPMENT_COLUMNS_SUFFIX
+        lane_columns = list(_LANE_IDENTITY_COLUMNS_BASE)
+        insert_at = lane_columns.index("Port of Loading ") + 1
+        lane_columns.insert(insert_at, ORIGIN_CITY_RAW_COLUMN)
+        LANE_IDENTITY_COLUMNS = tuple(lane_columns)
+    else:
+        SHIPMENT_COLUMNS = _SHIPMENT_COLUMNS_PREFIX + _SHIPMENT_COLUMNS_SUFFIX
+        LANE_IDENTITY_COLUMNS = _LANE_IDENTITY_COLUMNS_BASE
+
+    return SHIPMENT_COLUMNS
+
 
 COST_GROUP_ROW = 1
 COST_NAME_ROW = 2
@@ -137,8 +193,175 @@ def rate_value(value: object) -> float | int | None:
     return number
 
 
-def transport_cost_name(equipment_type: str) -> str:
-    return f"Transport cost ({equipment_type})"
+def transport_cost_name(equipment_type: str, validity_label: str = "") -> str:
+    base = f"Transport cost ({equipment_type})"
+    if validity_label:
+        return f"{base} ({validity_label})"
+    return base
+
+
+def currency_column_name(validity_label: str = "") -> str:
+    if validity_label:
+        return f"{CURRENCY_COLUMN} ({validity_label})"
+    return CURRENCY_COLUMN
+
+
+def is_currency_column(column_name: str) -> bool:
+    return column_name == CURRENCY_COLUMN or column_name.startswith(f"{CURRENCY_COLUMN} (")
+
+
+def parse_transport_cost_column(cost_column: str) -> tuple[str, str]:
+    prefix = "Transport cost ("
+    if not cost_column.startswith(prefix):
+        return "", ""
+    body = cost_column[len(prefix) :]
+    marker = ") ("
+    if body.endswith(")") and marker in body:
+        equipment_part, validity_part = body.rsplit(marker, 1)
+        return equipment_part, validity_part[:-1]
+    if body.endswith(")"):
+        return body[:-1], ""
+    return body, ""
+
+
+@dataclass(frozen=True)
+class TransportCostGroup:
+    validity_label: str
+    currency_column: str
+    cost_columns: tuple[str, ...]
+
+    @property
+    def group_title(self) -> str:
+        if self.validity_label:
+            return f"Grouped cost: Transport cost ({self.validity_label})"
+        return "Grouped cost: Transport cost"
+
+
+def transport_cost_groups_from_columns(columns: list[str]) -> list[TransportCostGroup]:
+    grouped: dict[str, list[str]] = {}
+
+    for column in columns:
+        _equipment, validity = parse_transport_cost_column(column)
+        grouped.setdefault(validity, []).append(column)
+
+    ordered_validities = sort_validity_labels(list(grouped.keys()))
+
+    return [
+        TransportCostGroup(
+            validity_label=validity,
+            currency_column=currency_column_name(validity),
+            cost_columns=tuple(grouped[validity]),
+        )
+        for validity in ordered_validities
+        if validity in grouped
+    ]
+
+
+def format_display_date(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, datetime):
+        return value.date().strftime("%d.%m.%Y")
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    text = cell_text(value)
+    if not text:
+        return ""
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%d.%m.%Y")
+        except ValueError:
+            continue
+    return text
+
+
+def format_validity_label(valid_from: object, valid_to: object) -> str:
+    from_text = format_display_date(valid_from)
+    to_text = format_display_date(valid_to)
+    if from_text and to_text:
+        return f"{from_text}-{to_text}"
+    return from_text or to_text
+
+
+def parse_validity_label_start(label: str) -> date:
+    text = cell_text(label)
+    if not text or "-" not in text:
+        return date.max
+    from_text = text.split("-", 1)[0].strip()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(from_text, fmt).date()
+        except ValueError:
+            continue
+    return date.max
+
+
+def sort_validity_labels(labels: list[str]) -> list[str]:
+    unique_labels = list(dict.fromkeys(labels))
+    non_empty = [label for label in unique_labels if label]
+    empty = [label for label in unique_labels if not label]
+    return sorted(non_empty, key=lambda label: (parse_validity_label_start(label), label)) + empty
+
+
+def sort_value_columns_by_validity(
+    df: pd.DataFrame,
+    value_columns: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    return sorted(
+        value_columns,
+        key=lambda item: (
+            parse_validity_label_start(validity_label_for_value_column(df, item[0])),
+            validity_label_for_value_column(df, item[0]),
+            item[0],
+        ),
+    )
+
+
+def _value_column_suffix(value_column: str) -> str:
+    match = re.match(r"^.+_(\d+)$", value_column)
+    return f"_{match.group(1)}" if match else ""
+
+
+def _validity_columns_for_value_column(value_column: str) -> tuple[str, str]:
+    suffix = _value_column_suffix(value_column)
+    if suffix:
+        return f"{VALID_FROM_COLUMN}{suffix}", f"{VALID_TO_COLUMN}{suffix}"
+    return VALID_FROM_COLUMN, VALID_TO_COLUMN
+
+
+def find_value_columns(df: pd.DataFrame) -> list[tuple[str, str]]:
+    columns: list[tuple[str, str]] = []
+    for column in df.columns:
+        match = VALUE_COLUMN_PATTERN.match(cell_text(column))
+        if match:
+            columns.append((str(column), match.group(1).strip().upper()))
+    return columns
+
+
+def find_value_column(df: pd.DataFrame) -> tuple[str, str] | None:
+    columns = find_value_columns(df)
+    if not columns:
+        return None
+    return columns[0]
+
+
+def validity_label_for_value_column(df: pd.DataFrame, value_column: str) -> str:
+    from_col, to_col = _validity_columns_for_value_column(value_column)
+    if from_col not in df.columns and _value_column_suffix(value_column):
+        from_col, to_col = VALID_FROM_COLUMN, VALID_TO_COLUMN
+
+    for _, row in df.iterrows():
+        label = format_validity_label(row.get(from_col), row.get(to_col))
+        if label:
+            return label
+    return ""
+
+
+def validity_label_from_row(row: pd.Series, value_column: str) -> str:
+    from_col, to_col = _validity_columns_for_value_column(value_column)
+    if from_col not in row.index and _value_column_suffix(value_column):
+        from_col, to_col = VALID_FROM_COLUMN, VALID_TO_COLUMN
+    return format_validity_label(row.get(from_col), row.get(to_col))
 
 
 def expand_equipment_types(equipment: object) -> tuple[str, ...]:
@@ -205,10 +428,8 @@ def rate_by_for_equipment(equipment_type: str) -> str:
 
 
 def rate_by_for_cost_column(cost_column: str) -> str:
-    prefix = "Transport cost ("
-    suffix = ")"
-    if cost_column.startswith(prefix) and cost_column.endswith(suffix):
-        equipment_type = cost_column[len(prefix) : -len(suffix)]
+    equipment_type, _validity = parse_transport_cost_column(cost_column)
+    if equipment_type:
         return rate_by_for_equipment(equipment_type)
     return "Rate by:\nRegular rule"
 
@@ -222,7 +443,8 @@ def transport_cost_columns_from_df(matrix_df: pd.DataFrame) -> list[str]:
 
 
 def service_fee_cost_columns_from_df(matrix_df: pd.DataFrame) -> list[str]:
-    excluded = set(SHIPMENT_COLUMNS) | {"Currency"} | set(transport_cost_columns_from_df(matrix_df))
+    excluded = set(SHIPMENT_COLUMNS) | set(transport_cost_columns_from_df(matrix_df))
+    excluded.update(column for column in matrix_df.columns if is_currency_column(column))
     return [column for column in matrix_df.columns if column not in excluded]
 
 
@@ -230,12 +452,17 @@ def all_cost_columns_from_df(matrix_df: pd.DataFrame) -> list[str]:
     return transport_cost_columns_from_df(matrix_df) + service_fee_cost_columns_from_df(matrix_df)
 
 
-def find_value_column(df: pd.DataFrame) -> tuple[str, str] | None:
-    for column in df.columns:
-        match = VALUE_COLUMN_PATTERN.match(cell_text(column))
-        if match:
-            return str(column), match.group(1).strip().upper()
-    return None
+def matrix_transport_section_columns(matrix_df: pd.DataFrame) -> list[str]:
+    transport_columns = transport_cost_columns_from_df(matrix_df)
+    section_columns: list[str] = []
+    for group in transport_cost_groups_from_columns(transport_columns):
+        section_columns.append(group.currency_column)
+        section_columns.extend(group.cost_columns)
+    return section_columns
+
+
+def matrix_ordered_value_columns(matrix_df: pd.DataFrame) -> list[str]:
+    return [*matrix_transport_section_columns(matrix_df), *service_fee_cost_columns_from_df(matrix_df)]
 
 
 def sort_equipment_types(equipment_types: set[str]) -> list[str]:
@@ -248,15 +475,51 @@ def sort_equipment_types(equipment_types: set[str]) -> list[str]:
 
 
 def collect_transport_cost_columns(rate_tabs: list[tuple[str, pd.DataFrame]]) -> list[str]:
-    equipment_types: set[str] = set()
+    specs = collect_transport_cost_specs(rate_tabs)
+    return [transport_cost_name(equipment, validity) for validity, equipment in specs]
+
+
+def collect_transport_cost_specs(
+    rate_tabs: list[tuple[str, pd.DataFrame]],
+) -> list[tuple[str, str]]:
+    specs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    validity_order: list[str] = []
 
     for _, source_df in rate_tabs:
-        if "Equipment Type" not in source_df.columns:
-            continue
-        for equipment in source_df["Equipment Type"].dropna().unique():
-            equipment_types.update(expand_equipment_types(equipment))
+        value_columns = find_value_columns(source_df)
+        use_validity = len(value_columns) > 1
+        if use_validity:
+            value_columns = sort_value_columns_by_validity(source_df, value_columns)
 
-    return [transport_cost_name(equipment) for equipment in sort_equipment_types(equipment_types)]
+        equipment_types: set[str] = set()
+        if "Equipment Type" in source_df.columns:
+            for equipment in source_df["Equipment Type"].dropna().unique():
+                equipment_types.update(expand_equipment_types(equipment))
+
+        for value_column, _currency in value_columns:
+            validity_label = (
+                validity_label_for_value_column(source_df, value_column) if use_validity else ""
+            )
+            if validity_label and validity_label not in validity_order:
+                validity_order.append(validity_label)
+            for equipment in sort_equipment_types(equipment_types):
+                key = (validity_label, equipment)
+                if key in seen:
+                    continue
+                seen.add(key)
+                specs.append(key)
+
+    if validity_order:
+        equipment_order = {name: idx for idx, name in enumerate(EQUIPMENT_SORT_ORDER)}
+        specs.sort(
+            key=lambda item: (
+                validity_order.index(item[0]) if item[0] in validity_order else len(validity_order),
+                equipment_order.get(item[1], len(EQUIPMENT_SORT_ORDER)),
+                item[1],
+            )
+        )
+    return specs
 
 
 def list_extracted_files() -> list[Path]:
@@ -327,6 +590,22 @@ def destination_city_label(city: object) -> str:
     return f"{text} (Destination)"
 
 
+def origin_city_label(city: object) -> str:
+    text = cell_text(city)
+    if not text:
+        return ""
+    if text.lower().endswith("(origin)"):
+        return text
+    return f"{text} (Origin)"
+
+
+def prompt_include_origin_city(*, auto: bool = False) -> bool:
+    if auto:
+        print("\nAuto mode: Origin City shipment columns disabled.")
+        return False
+    return ask_yes_no("Are Origin City shipment columns required?")
+
+
 def _column_or_blank(df: pd.DataFrame, column_name: str) -> pd.Series:
     if column_name not in df.columns:
         return pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
@@ -345,11 +624,29 @@ def _is_equipment_type_accessorial(accessorial: str) -> bool:
     return bool(EQUIPMENT_TYPE_ACCESSORIAL_PATTERN.search(cell_text(accessorial)))
 
 
-def _is_per_exact_container_type_fee(row: pd.Series) -> bool:
+def _is_generic_container_rate_basis(rate_basis: object) -> bool:
+    text = cell_text(rate_basis)
+    if not text:
+        return False
+    if EXACT_CONTAINER_RATE_BASIS_PATTERN.match(text):
+        return True
+    if GENERIC_CONTAINER_RATE_BASIS_PATTERN.search(text):
+        return True
+    if CONTAINER_SIZE_BASIS_PATTERN.search(text):
+        return True
+    return False
+
+
+def _is_per_container_fee(row: pd.Series) -> bool:
+    """True when a fee is measured per container and belongs on Accessorial costs only."""
     rate_basis = cell_text(row.get(SERVICE_FEE_RATE_BASIS_COLUMN))
-    if EXACT_CONTAINER_RATE_BASIS_PATTERN.match(rate_basis):
+    if _is_generic_container_rate_basis(rate_basis):
         return True
     return _is_equipment_type_accessorial(row.get(SERVICE_FEE_ACCESSORIAL_COLUMN))
+
+
+def _is_per_exact_container_type_fee(row: pd.Series) -> bool:
+    return _is_per_container_fee(row)
 
 
 def _inherits_previous_charge(row: pd.Series) -> bool:
@@ -551,7 +848,7 @@ def extract_approved_service_fees(service_fees_df: pd.DataFrame) -> list[tuple[s
 
     for item in resolved_rows:
         row = item["row"]
-        if _is_per_exact_container_type_fee(row):
+        if _is_per_container_fee(row):
             continue
 
         charge = cell_text(item.get("charge"))
@@ -646,10 +943,11 @@ def build_special_lane_row(
     row: dict[str, object] = {column: "" for column in SHIPMENT_COLUMNS}
     row["Lane #"] = lane_number
     row["Service Type"] = SPECIAL_SERVICE_TYPE
-    row["Currency"] = ""
 
-    for column in transport_cost_columns:
-        row[column] = None
+    for group in transport_cost_groups_from_columns(transport_cost_columns):
+        row[group.currency_column] = ""
+        for column in group.cost_columns:
+            row[column] = None
 
     for column_name, rate, _currency, _rate_by in service_fees:
         row[column_name] = rate
@@ -688,8 +986,7 @@ def append_special_lane(
 
     ordered_columns = [
         *SHIPMENT_COLUMNS,
-        "Currency",
-        *transport_cost_columns,
+        *matrix_transport_section_columns(result),
         *service_fee_columns,
     ]
     return result.loc[:, ordered_columns], rate_by_map, currency_map, service_fees
@@ -789,7 +1086,12 @@ def count_source_lane_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> int:
     return sum(len(source_df) for _, source_df in rate_tabs)
 
 
-def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame:
+def build_shipment_and_cost_rows(
+    rate_tabs: list[tuple[str, pd.DataFrame]],
+    *,
+    include_origin_city: bool = False,
+) -> pd.DataFrame:
+    set_include_origin_city(include_origin_city)
     transport_cost_columns = collect_transport_cost_columns(rate_tabs)
     rows: list[dict[str, object]] = []
     lane_number = 0
@@ -798,19 +1100,14 @@ def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> p
         port_of_loading = _column_or_blank(source_df, "Port of Loading")
         port_of_entry = _column_or_blank(source_df, "Port of Entry")
         destination_city = _column_or_blank(source_df, "Destination City")
-        value_column_info = find_value_column(source_df)
+        origin_city = _column_or_blank(source_df, ORIGIN_CITY_RAW_COLUMN)
+        value_columns = find_value_columns(source_df)
+        use_validity = len(value_columns) > 1
 
         for row_idx, source_row in source_df.iterrows():
             lane_number += 1
             equipment = source_row.get("Equipment Type")
             expanded_equipment = expand_equipment_types(equipment)
-
-            rate_amount = None
-            currency = ""
-            if value_column_info is not None:
-                value_column, currency_code = value_column_info
-                rate_amount = rate_value(source_row.get(value_column))
-                currency = currency_code if rate_amount is not None else ""
 
             matrix_row: dict[str, object] = {
                 "Lane #": lane_number,
@@ -825,34 +1122,53 @@ def build_shipment_and_cost_rows(rate_tabs: list[tuple[str, pd.DataFrame]]) -> p
                 "Destination City": cell_text(destination_city.loc[row_idx]),
                 "Destination City ": destination_city_label(destination_city.loc[row_idx]),
                 "Equipment Type": tab_equipment_type(tab_name),
-                "Currency": currency,
             }
 
-            for cost_column in transport_cost_columns:
-                matrix_row[cost_column] = None
+            if include_origin_city:
+                matrix_row[ORIGIN_CITY_RAW_COLUMN] = cell_text(origin_city.loc[row_idx])
+                matrix_row[ORIGIN_CITY_LABEL_COLUMN] = origin_city_label(origin_city.loc[row_idx])
 
-            for equipment_type in expanded_equipment:
-                matrix_row[transport_cost_name(equipment_type)] = rate_amount
+            for group in transport_cost_groups_from_columns(transport_cost_columns):
+                matrix_row[group.currency_column] = ""
+                for cost_column in group.cost_columns:
+                    matrix_row[cost_column] = None
+
+            if not value_columns:
+                for equipment_type in expanded_equipment:
+                    matrix_row[transport_cost_name(equipment_type)] = None
+            else:
+                ordered_value_columns = (
+                    sort_value_columns_by_validity(source_df, value_columns)
+                    if use_validity
+                    else value_columns
+                )
+                for value_column, currency_code in ordered_value_columns:
+                    validity_label = (
+                        validity_label_from_row(source_row, value_column) if use_validity else ""
+                    )
+                    rate_amount = rate_value(source_row.get(value_column))
+                    currency_column = currency_column_name(validity_label)
+                    if rate_amount is not None:
+                        matrix_row[currency_column] = currency_code
+
+                    for equipment_type in expanded_equipment:
+                        cost_column = transport_cost_name(
+                            equipment_type,
+                            validity_label if use_validity else "",
+                        )
+                        matrix_row[cost_column] = rate_amount
 
             rows.append(matrix_row)
 
     if not rows:
-        return pd.DataFrame(columns=[*SHIPMENT_COLUMNS, "Currency", *transport_cost_columns])
+        section_columns: list[str] = []
+        for group in transport_cost_groups_from_columns(transport_cost_columns):
+            section_columns.append(group.currency_column)
+            section_columns.extend(group.cost_columns)
+        return pd.DataFrame(columns=[*SHIPMENT_COLUMNS, *section_columns])
 
     matrix_df = pd.DataFrame(rows)
     return merge_unique_lanes(matrix_df)
-
-
-LANE_IDENTITY_COLUMNS = (
-    "Service Type",
-    "Origin Country",
-    "Port of Loading",
-    "Port of Loading ",
-    "Port of Entry",
-    "Port of Entry ",
-    "Destination City",
-    "Equipment Type",
-)
 
 
 def _lane_identity_key(row: pd.Series) -> tuple[str, ...]:
@@ -947,7 +1263,7 @@ def merge_unique_lanes(matrix_df: pd.DataFrame) -> pd.DataFrame:
     result = pd.DataFrame(merged_rows)
     result["Lane #"] = range(1, len(result) + 1)
 
-    ordered_columns = [*SHIPMENT_COLUMNS, "Currency", *transport_cost_columns]
+    ordered_columns = [*SHIPMENT_COLUMNS, *matrix_transport_section_columns(matrix_df)]
     return result.loc[:, ordered_columns]
 
 
@@ -1030,18 +1346,23 @@ def write_matrix_sheet(
     worksheet.title = sheet_name
 
     transport_cost_columns = transport_cost_columns_from_df(matrix_df)
+    transport_groups = transport_cost_groups_from_columns(transport_cost_columns)
     service_fee_columns = service_fee_cost_columns_from_df(matrix_df)
     service_fee_rate_by = service_fee_rate_by or {}
     service_fee_currencies = service_fee_currencies or {}
     duplicate_row_indices = duplicate_row_indices or set()
 
     shipment_count = len(SHIPMENT_COLUMNS)
-    transport_currency_col = shipment_count + 1
-    transport_rate_start_col = transport_currency_col + 1
-    if transport_cost_columns:
-        transport_rate_end_col = transport_rate_start_col + len(transport_cost_columns) - 1
-    else:
-        transport_rate_end_col = transport_currency_col
+    transport_group_layout: list[tuple[TransportCostGroup, int, int, int]] = []
+    next_col = shipment_count + 1
+    for group in transport_groups:
+        currency_col = next_col
+        rate_start_col = currency_col + 1
+        rate_end_col = rate_start_col + len(group.cost_columns) - 1
+        transport_group_layout.append((group, currency_col, rate_start_col, rate_end_col))
+        next_col = rate_end_col + 1
+
+    transport_rate_end_col = next_col - 1 if transport_groups else shipment_count
 
     service_fee_column_pairs: list[tuple[str, int, int]] = []
     next_col = transport_rate_end_col + 1
@@ -1054,33 +1375,35 @@ def write_matrix_sheet(
     else:
         service_fee_end_col = transport_rate_end_col
 
-    if transport_cost_columns:
+    for group, currency_col, rate_start_col, rate_end_col in transport_group_layout:
         _write_merged_header_cell(
             worksheet,
             COST_GROUP_ROW,
-            transport_currency_col,
-            transport_rate_end_col,
-            "Grouped cost: Transport cost",
+            currency_col,
+            rate_end_col,
+            group.group_title,
             fill=TRANSPORT_GROUP_FILL,
         )
 
-        for offset, cost_name in enumerate(transport_cost_columns, start=transport_rate_start_col):
-            cell = worksheet.cell(COST_NAME_ROW, offset, cost_name)
+        for offset, cost_name in enumerate(group.cost_columns, start=rate_start_col):
+            equipment_type, _validity = parse_transport_cost_column(cost_name)
+            display_name = transport_cost_name(equipment_type) if equipment_type else cost_name
+            cell = worksheet.cell(COST_NAME_ROW, offset, display_name)
             _style_header_cell(cell, fill=TRANSPORT_COST_FILL, center=True)
 
         _write_merged_meta_cell(
             worksheet,
             APPLY_IF_ROW,
-            transport_currency_col,
-            transport_rate_end_col,
+            currency_col,
+            rate_end_col,
             "Applies if invoiced by Carrier",
         )
 
-        for offset, cost_name in enumerate(transport_cost_columns, start=transport_rate_start_col):
+        for offset, cost_name in enumerate(group.cost_columns, start=rate_start_col):
             cell = worksheet.cell(RATE_BY_ROW, offset, rate_by_for_cost_column(cost_name))
             _style_cost_meta_cell(cell)
 
-        currency_rate_by = worksheet.cell(RATE_BY_ROW, transport_currency_col)
+        currency_rate_by = worksheet.cell(RATE_BY_ROW, currency_col)
         _style_cost_meta_cell(currency_rate_by)
 
     for cost_name, currency_col, rate_col in service_fee_column_pairs:
@@ -1114,13 +1437,13 @@ def write_matrix_sheet(
 
     for col_index, header in enumerate(SHIPMENT_COLUMNS, start=1):
         cell = worksheet.cell(COLUMN_HEADER_ROW, col_index, header)
-        _style_header_cell(cell, bold=header in {"Lane #", "Service Type", "Destination City ", "Equipment Type"})
+        _style_header_cell(cell, bold=header in {"Lane #", "Service Type", "Destination City ", "Origin City ", "Equipment Type"})
 
-    if transport_cost_columns:
-        transport_currency_header = worksheet.cell(COLUMN_HEADER_ROW, transport_currency_col, "Currency")
-        _style_header_cell(transport_currency_header, center=True, fill=TRANSPORT_COST_FILL)
+    for group, currency_col, rate_start_col, rate_end_col in transport_group_layout:
+        currency_header = worksheet.cell(COLUMN_HEADER_ROW, currency_col, "Currency")
+        _style_header_cell(currency_header, center=True, fill=TRANSPORT_COST_FILL)
 
-        for offset in range(transport_rate_start_col, transport_rate_end_col + 1):
+        for offset in range(rate_start_col, rate_end_col + 1):
             header_cell = worksheet.cell(COLUMN_HEADER_ROW, offset, "p/unit")
             _style_header_cell(header_cell, center=True, fill=TRANSPORT_COST_FILL)
 
@@ -1146,9 +1469,9 @@ def write_matrix_sheet(
             elif is_special:
                 cell.fill = SPECIAL_ROW_FILL
 
-        if transport_cost_columns:
-            transport_currency_value = "" if is_special else row.get("Currency")
-            currency_cell = worksheet.cell(excel_row, transport_currency_col, transport_currency_value)
+        for group, currency_col, rate_start_col, rate_end_col in transport_group_layout:
+            transport_currency_value = "" if is_special else row.get(group.currency_column)
+            currency_cell = worksheet.cell(excel_row, currency_col, transport_currency_value)
             currency_cell.alignment = CENTER
             currency_cell.border = THIN_BORDER
             if row_fill is not None:
@@ -1156,7 +1479,7 @@ def write_matrix_sheet(
             elif is_special:
                 currency_cell.fill = SPECIAL_ROW_FILL
 
-            for offset, cost_name in enumerate(transport_cost_columns, start=transport_rate_start_col):
+            for offset, cost_name in enumerate(group.cost_columns, start=rate_start_col):
                 value = row.get(cost_name)
                 cell = worksheet.cell(excel_row, offset)
                 cell.border = THIN_BORDER
@@ -1194,9 +1517,9 @@ def write_matrix_sheet(
     for col_index, header in enumerate(SHIPMENT_COLUMNS, start=1):
         worksheet.column_dimensions[get_column_letter(col_index)].width = _column_width_for_header(header)
 
-    if transport_cost_columns:
-        worksheet.column_dimensions[get_column_letter(transport_currency_col)].width = 12.0
-        for offset, cost_name in enumerate(transport_cost_columns, start=transport_rate_start_col):
+    for group, currency_col, rate_start_col, rate_end_col in transport_group_layout:
+        worksheet.column_dimensions[get_column_letter(currency_col)].width = 12.0
+        for offset, cost_name in enumerate(group.cost_columns, start=rate_start_col):
             worksheet.column_dimensions[get_column_letter(offset)].width = _column_width_for_header(cost_name)
 
     for cost_name, currency_col, rate_col in service_fee_column_pairs:
@@ -1269,7 +1592,11 @@ def run_build_matrix(
     for tab_name, tab_df in rate_tabs:
         print(f"  - {tab_name}: {len(tab_df)} lane rows")
 
-    matrix_df = build_shipment_and_cost_rows(rate_tabs)
+    include_origin_city = prompt_include_origin_city(auto=auto)
+    if include_origin_city:
+        print("  Origin City shipment columns enabled")
+
+    matrix_df = build_shipment_and_cost_rows(rate_tabs, include_origin_city=include_origin_city)
     source_lane_count = count_source_lane_rows(rate_tabs)
     if source_lane_count != len(matrix_df):
         print(
@@ -1310,6 +1637,7 @@ def run_build_matrix(
         source_file=file_path,
         matrix_path=saved_path,
         matrix_df=matrix_df,
+        include_origin_city=include_origin_city,
     )
 
     print(
