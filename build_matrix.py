@@ -567,6 +567,8 @@ def is_rate_tab(sheet_name: str) -> bool:
     lower = sheet_name.strip().lower()
     if lower == BASE_RATE_TAB:
         return True
+    if "fastboat" in lower:
+        return True
     if "bcl" in lower:
         return True
     return False
@@ -575,6 +577,8 @@ def is_rate_tab(sheet_name: str) -> bool:
 def tab_equipment_type(sheet_name: str) -> str:
     lower = sheet_name.strip().lower()
     if lower == BASE_RATE_TAB:
+        return "FCL"
+    if "fastboat" in lower:
         return "FCL"
     if "bcl" in lower:
         return "BCL"
@@ -1585,7 +1589,7 @@ def run_build_matrix(
     if not rate_tabs:
         raise RuntimeError(
             f"No rate tabs found in {file_path.name}. "
-            "Expected Base Freight Rates and/or BCL tabs."
+            "Expected Base Freight Rates, Fastboat, and/or BCL tabs."
         )
 
     print(f"\nBuilding matrix from {file_path.name}:")
