@@ -25,8 +25,9 @@ from project_paths import OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs
 
 EXTRACTED_GLOB = "*_extracted.xlsx"
 
-BASE_RATE_TAB = "base freight rates"
+ADDITIONAL_INFO_TAB = "additional info"
 SERVICE_FEES_TAB = "service fees"
+NON_RATE_TABS = frozenset({ADDITIONAL_INFO_TAB, SERVICE_FEES_TAB})
 SPECIAL_SERVICE_TYPE = "SPECIAL"
 APPLE_DISPOSITION_COLUMN = "Apple desposition"
 APPROVED_DISPOSITION = "approved"
@@ -564,25 +565,15 @@ def select_extracted_file(files: list[Path]) -> Path:
 
 
 def is_rate_tab(sheet_name: str) -> bool:
-    lower = sheet_name.strip().lower()
-    if lower == BASE_RATE_TAB:
-        return True
-    if "fastboat" in lower:
-        return True
-    if "bcl" in lower:
-        return True
-    return False
+    """All user-selected processing tabs are rate tabs except dedicated metadata tabs."""
+    return sheet_name.strip().lower() not in NON_RATE_TABS
 
 
 def tab_equipment_type(sheet_name: str) -> str:
     lower = sheet_name.strip().lower()
-    if lower == BASE_RATE_TAB:
-        return "FCL"
-    if "fastboat" in lower:
-        return "FCL"
     if "bcl" in lower:
         return "BCL"
-    return ""
+    return "FCL"
 
 
 def destination_city_label(city: object) -> str:
@@ -1589,7 +1580,7 @@ def run_build_matrix(
     if not rate_tabs:
         raise RuntimeError(
             f"No rate tabs found in {file_path.name}. "
-            "Expected Base Freight Rates, Fastboat, and/or BCL tabs."
+            "Expected at least one lane tab besides Additional Info and Service Fees."
         )
 
     print(f"\nBuilding matrix from {file_path.name}:")
