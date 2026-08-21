@@ -7,6 +7,7 @@ Output columns (tab-separated):
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from build_matrix import (
     ORIGIN_CITY_LABEL_COLUMN,
     SHIPMENT_COLUMNS,
     cell_text,
+    exclude_additional_info_accessorial_rows,
 )
 from country_codes import to_country_iso
 from project_paths import OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs
@@ -50,6 +52,60 @@ class PostalCodeZone:
         return "\t".join([self.name, self.country, self.postal_code, self.excluded])
 
 
+def _ascii_fold(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text)
+    return "".join(character for character in normalized if not unicodedata.combining(character))
+
+
+def _city_group_key(city: str) -> str:
+    """Case/spacing/diacritic-insensitive key for grouping common-rating cities."""
+    return _ascii_fold(city).casefold().replace(" ", "")
+
+
+def _zone_display_name(city: str) -> str:
+    """ASCII-fold diacritics for zone names; keep spaces."""
+    return _ascii_fold(city).strip()
+
+
+def _compact_postal_city(city: str) -> str:
+    """Remove spaces from postal code values, e.g. Hong Kong -> HongKong."""
+    text = city.strip()
+    parts = [part for part in text.split() if part]
+    if len(parts) <= 1:
+        return text.replace(" ", "")
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def _postal_code_value(city: str, country: str, common_rating_city: str) -> str:
+    if country in {"US", "CA"}:
+        formatted = format_us_ca_postal_city(city, country, common_rating_city)
+        if "_" in formatted:
+            return formatted
+        return _compact_postal_city(formatted)
+    return _compact_postal_city(city)
+
+
+def _format_zone_name(city: str, suffix: str) -> str:
+    return f"{_zone_display_name(city)} ({suffix})"
+
+
+def _zone_match_key(label: str) -> str:
+    text = cell_text(label)
+    for suffix in (DESTINATION_LABEL_SUFFIX, ORIGIN_LABEL_SUFFIX):
+        if text.endswith(suffix):
+            base_city = text[: -len(suffix)].strip()
+            return f"{_city_group_key(base_city)}|{suffix.casefold()}"
+    return _city_group_key(text)
+
+
+def _normalize_zone_label(label: str) -> str:
+    for suffix in (DESTINATION_LABEL_SUFFIX, ORIGIN_LABEL_SUFFIX):
+        if label.endswith(suffix):
+            base_city = label[: -len(suffix)].strip()
+            return f"{_zone_display_name(base_city)}{suffix}"
+    return _zone_display_name(label)
+
+
 def load_additional_info(file_path: Path) -> pd.DataFrame:
     workbook = pd.ExcelFile(file_path)
     if "Additional Info" not in workbook.sheet_names:
@@ -68,6 +124,22 @@ def _unique_preserve_order(values: list[str]) -> list[str]:
         if key in seen:
             continue
         seen.add(key)
+        result.append(text)
+    return result
+
+
+def _unique_postal_values(values: list[str]) -> list[str]:
+    """Preserve order; keep diacritic variants, drop exact duplicates."""
+    seen_exact: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = cell_text(value)
+        if not text:
+            continue
+        exact_key = text.casefold()
+        if exact_key in seen_exact:
+            continue
+        seen_exact.add(exact_key)
         result.append(text)
     return result
 
@@ -92,7 +164,7 @@ def _build_zones_from_section(
     if section_df.empty:
         return []
 
-    grouped: dict[tuple[str, str], list[str]] = {}
+    grouped: dict[tuple[str, str], dict[str, object]] = {}
     for _, row in section_df.iterrows():
         common_rating_city = cell_text(row.get("Common Rating City"))
         country = _normalize_country(row.get(country_column))
@@ -100,20 +172,28 @@ def _build_zones_from_section(
         if not common_rating_city or not country or not city:
             continue
 
-        key = (common_rating_city, country)
-        grouped.setdefault(key, []).append(city)
+        group_key = (_city_group_key(common_rating_city), country)
+        bucket = grouped.setdefault(
+            group_key,
+            {"display_city": common_rating_city, "common_rating_variants": set(), "cities": []},
+        )
+        bucket["common_rating_variants"].add(common_rating_city)
+        bucket["cities"].append(city)
 
     zones: list[PostalCodeZone] = []
-    for (common_rating_city, country), cities in grouped.items():
+    for (_city_key, country), bucket in grouped.items():
+        display_city = str(bucket["display_city"])
+        cities = bucket["cities"]
         unique_cities = _unique_preserve_order(cities)
-        postal_cities = [common_rating_city, *unique_cities]
-        postal_cities = _unique_preserve_order(postal_cities)
+        rating_variants = _unique_preserve_order(list(bucket["common_rating_variants"]))
+        postal_cities = _unique_postal_values([display_city, *rating_variants, *unique_cities])
         postal_values = [
-            format_us_ca_postal_city(city, country, common_rating_city) for city in postal_cities
+            _postal_code_value(city, country, display_city) for city in postal_cities
         ]
+        postal_values = _unique_preserve_order(postal_values)
         zones.append(
             PostalCodeZone(
-                name=f"{common_rating_city} ({suffix})",
+                name=_format_zone_name(display_city, suffix),
                 country=country,
                 postal_code=", ".join(postal_values),
             )
@@ -123,11 +203,12 @@ def _build_zones_from_section(
 
 
 def build_postal_code_zones(additional_info_df: pd.DataFrame) -> list[PostalCodeZone]:
-    origin_df = additional_info_df[
-        additional_info_df["Section Title"].astype(str).eq(ORIGIN_COMMON_RATING_SECTION)
+    rating_df = exclude_additional_info_accessorial_rows(additional_info_df)
+    origin_df = rating_df[
+        rating_df["Section Title"].astype(str).eq(ORIGIN_COMMON_RATING_SECTION)
     ]
-    destination_df = additional_info_df[
-        additional_info_df["Section Title"].astype(str).eq(DESTINATION_COMMON_RATING_SECTION)
+    destination_df = rating_df[
+        rating_df["Section Title"].astype(str).eq(DESTINATION_COMMON_RATING_SECTION)
     ]
 
     zones = [
@@ -173,7 +254,7 @@ def _matrix_city_labels(
         if not label or not country:
             continue
 
-        key = label.casefold()
+        key = _zone_match_key(label)
         if key in seen:
             continue
         seen.add(key)
@@ -200,29 +281,68 @@ def matrix_origin_labels(matrix_df: pd.DataFrame) -> list[tuple[str, str]]:
     )
 
 
+def _merge_postal_code_values(
+    postal_code: str,
+    extra_cities: list[str],
+    *,
+    country: str,
+    common_rating_city: str,
+) -> str:
+    merged = [part.strip() for part in postal_code.split(",") if part.strip()]
+    seen = {value.casefold() for value in merged}
+    for city in extra_cities:
+        compact = _postal_code_value(city, country, common_rating_city)
+        if compact.casefold() in seen:
+            continue
+        merged.append(compact)
+        seen.add(compact.casefold())
+    return ", ".join(merged)
+
+
 def _append_matrix_city_zones(
     matrix_labels: list[tuple[str, str]],
     *,
-    zones_by_name: dict[str, PostalCodeZone],
+    zones_by_match_key: dict[str, PostalCodeZone],
     label_suffix: str,
 ) -> list[PostalCodeZone]:
-    city_zones: list[PostalCodeZone] = []
+    labels_by_key: dict[str, list[tuple[str, str]]] = {}
     for label, country in matrix_labels:
-        if label in zones_by_name:
-            city_zones.append(zones_by_name[label])
+        labels_by_key.setdefault(_zone_match_key(label), []).append((label, country))
+
+    city_zones: list[PostalCodeZone] = []
+    for match_key, entries in labels_by_key.items():
+        label, country = entries[0]
+        extra_cities = [_base_city_from_label(entry_label, label_suffix) for entry_label, _ in entries]
+
+        if match_key in zones_by_match_key:
+            zone = zones_by_match_key[match_key]
+            display_city = _base_city_from_label(zone.name, label_suffix)
+            city_zones.append(
+                PostalCodeZone(
+                    name=zone.name,
+                    country=zone.country,
+                    postal_code=_merge_postal_code_values(
+                        zone.postal_code,
+                        extra_cities,
+                        country=country,
+                        common_rating_city=display_city,
+                    ),
+                    excluded=zone.excluded,
+                )
+            )
             continue
 
         base_city = _base_city_from_label(label, label_suffix)
-        postal_code = (
-            format_us_ca_postal_city(base_city, country, base_city)
-            if country in {"US", "CA"}
-            else base_city
-        )
         city_zones.append(
             PostalCodeZone(
-                name=label,
+                name=_normalize_zone_label(label),
                 country=country,
-                postal_code=postal_code,
+                postal_code=_merge_postal_code_values(
+                    "",
+                    extra_cities,
+                    country=country,
+                    common_rating_city=base_city,
+                ),
             )
         )
     return city_zones
@@ -235,14 +355,14 @@ def build_final_postal_zones(
     include_origin_city: bool = False,
 ) -> list[PostalCodeZone]:
     all_zones = build_postal_code_zones(additional_info_df)
-    zones_by_name = {zone.name: zone for zone in all_zones}
+    zones_by_match_key = {_zone_match_key(zone.name): zone for zone in all_zones}
 
     final_zones: list[PostalCodeZone] = []
     if include_origin_city:
         final_zones.extend(
             _append_matrix_city_zones(
                 matrix_origin_labels(matrix_df),
-                zones_by_name=zones_by_name,
+                zones_by_match_key=zones_by_match_key,
                 label_suffix=ORIGIN_LABEL_SUFFIX,
             )
         )
@@ -250,7 +370,7 @@ def build_final_postal_zones(
     final_zones.extend(
         _append_matrix_city_zones(
             matrix_destination_labels(matrix_df),
-            zones_by_name=zones_by_name,
+            zones_by_match_key=zones_by_match_key,
             label_suffix=DESTINATION_LABEL_SUFFIX,
         )
     )
@@ -293,13 +413,14 @@ def highlight_labeled_city_column(
     if not zone_names_set or column_name not in SHIPMENT_COLUMNS:
         return 0
 
+    zone_match_keys = {_zone_match_key(name) for name in zone_names_set}
     col_index = _city_column_index(column_name)
     highlighted = 0
 
     for row_index in range(DATA_START_ROW, worksheet.max_row + 1):
         cell = worksheet.cell(row_index, col_index)
         value = cell_text(cell.value)
-        if not value or value not in zone_names_set:
+        if not value or _zone_match_key(value) not in zone_match_keys:
             continue
 
         cell.fill = CITY_HIGHLIGHT_FILL
