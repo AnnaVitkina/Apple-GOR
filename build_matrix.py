@@ -39,7 +39,12 @@ SERVICE_FEE_ACCESSORIAL_COLUMN = "Accessorial Description"
 SERVICE_FEE_ORIGINS_COLUMN = "Origins"
 SERVICE_FEE_RATE_BASIS_COLUMN = "Rate Basis"
 
-VALUE_COLUMN_PATTERN = re.compile(r"^Value\s*\(([^)]+)\)(?:_\d+)?\s*$", re.IGNORECASE)
+VALUE_COLUMN_PATTERN = re.compile(
+    r"^Value\s*\(([^)]+)\)(?:\s+Grand\s+Total)?(?:_\d+)?\s*$",
+    re.IGNORECASE,
+)
+EMEIA_CMA_EXP_TAB = "emeia cma exp"
+FASTBOAT_TAB_MARKER = "fastboat"
 VALID_FROM_COLUMN = "Valid From"
 VALID_TO_COLUMN = "Valid To"
 CURRENCY_COLUMN = "Currency"
@@ -55,13 +60,33 @@ CONTAINER_SIZE_BASIS_PATTERN = re.compile(
 RATE_BASIS_SEGMENT_PATTERN = re.compile(r"^(\d+)(RE|HCRE|HC|CN|CZ|HV)$", re.IGNORECASE)
 EQUIPMENT_TYPE_ACCESSORIAL_PATTERN = re.compile(r"\d+'\s*(?:Std|HC)", re.IGNORECASE)
 
+ADDITIONAL_INFO_RATE_COLUMN = "Additional Rate (USD)"
+ORIGIN_COMMON_RATING_SECTION = "GOR25 Origin Common Rating"
+DESTINATION_COMMON_RATING_SECTION = "GOR25 Destination Common Rating"
+ADDITIONAL_INFO_DESCRIPTION_COLUMNS = (
+    "Accessorial Description",
+    "Charge Code Description",
+    "Description",
+    "Remarks",
+)
+
 SPLIT_EQUIPMENT_TYPES: dict[str, tuple[str, ...]] = {
+    "20' HC/Std Dry": ("20' HC Dry", "20' Std Dry"),
+    "20' Std/HC Dry": ("20' Std Dry", "20' HC Dry"),
+    "40' HC/Std Dry": ("40' HC Dry", "40' Std Dry"),
     "40' Std/HC Dry": ("40' Std Dry", "40' HC Dry"),
+    "40' HC/Std Reefer": ("40' HC Reefer", "40' Std Reefer"),
     "40' Std/HC Reefer": ("40' Std Reefer", "40' HC Reefer"),
 }
 
+COMBINED_EQUIPMENT_PATTERN = re.compile(
+    r"^(\d+\s*['\u2019]\s*)(HC|Std)\s*/\s*(HC|Std)\s*(Dry|Reefer)\s*$",
+    re.IGNORECASE,
+)
+
 EQUIPMENT_SORT_ORDER = (
     "20' Std Dry",
+    "20' HC Dry",
     "20' Std Reefer",
     "40' Std Dry",
     "40' Std Reefer",
@@ -185,8 +210,13 @@ def rate_value(value: object) -> float | int | None:
     text = cell_text(value)
     if not text or text.lower() in {"on request", "n/a", "#n/a"}:
         return None
+    cleaned = text.replace("$", "").replace("USD", "").strip()
+    cleaned = cleaned.replace(",", "")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    if not cleaned:
+        return None
     try:
-        number = float(str(value).replace(",", ""))
+        number = float(cleaned)
     except (TypeError, ValueError):
         return None
     if number.is_integer():
@@ -330,13 +360,60 @@ def _validity_columns_for_value_column(value_column: str) -> tuple[str, str]:
     return VALID_FROM_COLUMN, VALID_TO_COLUMN
 
 
-def find_value_columns(df: pd.DataFrame) -> list[tuple[str, str]]:
-    columns: list[tuple[str, str]] = []
+def _value_column_kind(column_name: str) -> str:
+    return "grand_total" if re.search(r"grand\s+total", column_name, re.IGNORECASE) else "standard"
+
+
+@dataclass(frozen=True)
+class ValueColumnGroup:
+    currency: str
+    standard_column: str | None
+    grand_total_column: str | None
+
+    @property
+    def validity_column(self) -> str | None:
+        return self.standard_column or self.grand_total_column
+
+    def rate_from_row(self, row: pd.Series) -> float | int | None:
+        if self.standard_column:
+            amount = rate_value(row.get(self.standard_column))
+            if amount is not None:
+                return amount
+        if self.grand_total_column:
+            return rate_value(row.get(self.grand_total_column))
+        return None
+
+
+def find_value_column_groups(df: pd.DataFrame) -> list[ValueColumnGroup]:
+    buckets: dict[tuple[str, str], dict[str, str]] = {}
     for column in df.columns:
-        match = VALUE_COLUMN_PATTERN.match(cell_text(column))
-        if match:
-            columns.append((str(column), match.group(1).strip().upper()))
-    return columns
+        text = cell_text(column)
+        match = VALUE_COLUMN_PATTERN.match(text)
+        if not match:
+            continue
+        currency = match.group(1).strip().upper()
+        suffix = _value_column_suffix(text)
+        kind = _value_column_kind(text)
+        buckets.setdefault((currency, suffix), {})[kind] = str(column)
+
+    groups: list[ValueColumnGroup] = []
+    for (currency, _suffix), columns in sorted(buckets.items()):
+        group = ValueColumnGroup(
+            currency=currency,
+            standard_column=columns.get("standard"),
+            grand_total_column=columns.get("grand_total"),
+        )
+        if group.validity_column:
+            groups.append(group)
+    return groups
+
+
+def find_value_columns(df: pd.DataFrame) -> list[tuple[str, str]]:
+    return [
+        (group.validity_column, group.currency)
+        for group in find_value_column_groups(df)
+        if group.validity_column
+    ]
 
 
 def find_value_column(df: pd.DataFrame) -> tuple[str, str] | None:
@@ -365,13 +442,74 @@ def validity_label_from_row(row: pd.Series, value_column: str) -> str:
     return format_validity_label(row.get(from_col), row.get(to_col))
 
 
+def _combined_equipment_split(text: str) -> tuple[str, ...] | None:
+    match = COMBINED_EQUIPMENT_PATTERN.match(cell_text(text))
+    if not match:
+        return None
+
+    size, part1, part2, kind = match.groups()
+    size_clean = re.sub(r"\s+", "", size.replace("\u2019", "'"))
+    if not size_clean.endswith("'"):
+        size_clean += "'"
+    kind_clean = kind[:1].upper() + kind[1:].lower()
+
+    types: list[str] = []
+    for part in (part1, part2):
+        if part.upper() == "HC":
+            types.append(f"{size_clean} HC {kind_clean}")
+        else:
+            types.append(f"{size_clean} Std {kind_clean}")
+    return tuple(dict.fromkeys(types))
+
+
+def is_combined_equipment_type(text: str) -> bool:
+    if text in SPLIT_EQUIPMENT_TYPES:
+        return True
+    if any(text.casefold() == key.casefold() for key in SPLIT_EQUIPMENT_TYPES):
+        return True
+    return _combined_equipment_split(text) is not None
+
+
 def expand_equipment_types(equipment: object) -> tuple[str, ...]:
     text = cell_text(equipment)
     if not text:
         return ()
-    if text in SPLIT_EQUIPMENT_TYPES:
-        return SPLIT_EQUIPMENT_TYPES[text]
+    split = SPLIT_EQUIPMENT_TYPES.get(text)
+    if split is None:
+        for key, value in SPLIT_EQUIPMENT_TYPES.items():
+            if text.casefold() == key.casefold():
+                split = value
+                break
+    if split is None:
+        split = _combined_equipment_split(text)
+    if split is not None:
+        return tuple(dict.fromkeys(split))
     return (text,)
+
+
+def collect_equipment_types_from_df(source_df: pd.DataFrame) -> set[str]:
+    """Collect unique equipment types, splitting combined values and skipping redundant standalones."""
+    if "Equipment Type" not in source_df.columns:
+        return set()
+
+    raw_values = [
+        cell_text(value)
+        for value in source_df["Equipment Type"].dropna().unique()
+        if cell_text(value)
+    ]
+
+    split_components: set[str] = set()
+    for text in raw_values:
+        if is_combined_equipment_type(text):
+            split_components.update(expand_equipment_types(text))
+
+    equipment_types: set[str] = set()
+    for text in raw_values:
+        if is_combined_equipment_type(text):
+            equipment_types.update(expand_equipment_types(text))
+        elif text not in split_components:
+            equipment_types.add(text)
+    return equipment_types
 
 
 def container_rate_code(equipment_type: str) -> str:
@@ -493,10 +631,7 @@ def collect_transport_cost_specs(
         if use_validity:
             value_columns = sort_value_columns_by_validity(source_df, value_columns)
 
-        equipment_types: set[str] = set()
-        if "Equipment Type" in source_df.columns:
-            for equipment in source_df["Equipment Type"].dropna().unique():
-                equipment_types.update(expand_equipment_types(equipment))
+        equipment_types = collect_equipment_types_from_df(source_df)
 
         for value_column, _currency in value_columns:
             validity_label = (
@@ -594,6 +729,48 @@ def origin_city_label(city: object) -> str:
     return f"{text} (Origin)"
 
 
+def is_emeia_cma_exp_tab(tab_name: str) -> bool:
+    return tab_name.strip().casefold() == EMEIA_CMA_EXP_TAB
+
+
+def is_fastboat_tab(tab_name: str) -> bool:
+    return FASTBOAT_TAB_MARKER in tab_name.strip().casefold()
+
+
+def is_fb_service_type_tab(tab_name: str) -> bool:
+    return is_emeia_cma_exp_tab(tab_name) or is_fastboat_tab(tab_name)
+
+
+def apply_fb_service_type(service_type: str, mode: str) -> str:
+    if not service_type or mode not in {"add", "replace"}:
+        return service_type
+    if mode == "add":
+        return f"FB-{service_type}"
+    if len(service_type) >= 2:
+        return f"FB{service_type[2:]}"
+    return f"FB{service_type}"
+
+
+def prompt_fb_service_type(*, auto: bool = False, tab_names: list[str] | None = None) -> str:
+    if auto:
+        print("\nAuto mode: Fastboat/EMEIA Service Type FB mode = add (FB- prefix).")
+        return "add"
+
+    if tab_names:
+        print(f"\nFB Service Type update required for tab(s): {', '.join(tab_names)}")
+    else:
+        print("\nFB Service Type update required.")
+    print("  1. Add FB- at the beginning of Service Type")
+    print("  2. Replace first 2 letters of Service Type with FB")
+    while True:
+        choice = input("Choose option (1-2): ").strip()
+        if choice == "1":
+            return "add"
+        if choice == "2":
+            return "replace"
+        print("Invalid choice. Enter 1 or 2.")
+
+
 def prompt_include_origin_city(*, auto: bool = False) -> bool:
     if auto:
         print("\nAuto mode: Origin City shipment columns disabled.")
@@ -613,6 +790,248 @@ def load_service_fees_tab(file_path: Path) -> pd.DataFrame | None:
         if sheet_name.strip().lower() == SERVICE_FEES_TAB:
             return pd.read_excel(file_path, sheet_name=sheet_name)
     return None
+
+
+def _find_dataframe_column(df: pd.DataFrame, *candidates: str) -> str | None:
+    columns = {cell_text(column).casefold(): column for column in df.columns}
+    for candidate in candidates:
+        match = columns.get(candidate.casefold())
+        if match is not None:
+            return match
+    return None
+
+
+def exclude_additional_info_accessorial_rows(additional_info_df: pd.DataFrame) -> pd.DataFrame:
+    """Drop Additional Info rows used for accessorial costs (non-empty Additional Rate)."""
+    rate_column = _find_dataframe_column(additional_info_df, ADDITIONAL_INFO_RATE_COLUMN)
+    if not rate_column:
+        return additional_info_df
+
+    keep_mask = additional_info_df[rate_column].map(rate_value).isna()
+    return additional_info_df.loc[keep_mask].copy()
+
+
+def _parse_slash_separated_equipment_types(text: str) -> list[str]:
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"\s*/\s*", text) if part.strip()]
+
+
+def _container_codes_from_equipment_text(equipment_text: str) -> list[str]:
+    codes: list[str] = []
+    seen: set[str] = set()
+    for equipment in _parse_slash_separated_equipment_types(equipment_text):
+        for expanded in expand_equipment_types(equipment):
+            code = container_rate_code(expanded)
+            if code and code not in seen:
+                seen.add(code)
+                codes.append(code)
+    return codes
+
+
+def _additional_info_accessorial_name(
+    row: pd.Series,
+    *,
+    description_column: str | None,
+    rate_column: str | None = None,
+) -> str:
+    if description_column:
+        name = cell_text(row.get(description_column))
+        if name:
+            return name
+    for column in ADDITIONAL_INFO_DESCRIPTION_COLUMNS:
+        if column in row.index:
+            name = cell_text(row.get(column))
+            if name:
+                return name
+
+    skip_columns = {
+        "Section Title",
+        "Origin Country",
+        "Destination Country",
+        "Valid From",
+        "Valid To",
+    }
+    if rate_column:
+        skip_columns.add(rate_column)
+
+    best = ""
+    for column in row.index:
+        if column in skip_columns:
+            continue
+        text = cell_text(row.get(column))
+        if not text or rate_value(text) is not None:
+            continue
+        if len(text) <= len(best):
+            continue
+        if text.upper() in {"ALL", "VN", "HPH"}:
+            continue
+        if re.fullmatch(r"\d+", text):
+            continue
+        if _parse_slash_separated_equipment_types(text) and "'" in text:
+            continue
+        best = text
+    return best
+
+
+def _additional_info_apply_if_city(row: pd.Series, section_title: str) -> str:
+    section_lower = cell_text(section_title).casefold()
+    if "origin" in section_lower:
+        column = "Origin City"
+    elif "destination" in section_lower:
+        column = "Destination City"
+    else:
+        return ""
+
+    if column in row.index:
+        return cell_text(row.get(column)).rstrip(",").strip()
+    return ""
+
+
+def _additional_info_accessorial_apply_if(row: pd.Series, section_title: str) -> str:
+    section_lower = cell_text(section_title).casefold()
+    city_prefix = _additional_info_apply_if_city(row, section_title)
+    if not city_prefix:
+        return ""
+
+    if "origin" in section_lower:
+        return f"SHIP_CITY starts with '{city_prefix}'"
+    if "destination" in section_lower:
+        return f"CUST_CITY starts with '{city_prefix}'"
+    return ""
+
+
+def _build_additional_info_accessorial_costs(
+    additional_info_df: pd.DataFrame,
+) -> list[tuple[str, float | int, str, str, str]]:
+    rate_column = _find_dataframe_column(additional_info_df, ADDITIONAL_INFO_RATE_COLUMN)
+    if not rate_column:
+        return []
+
+    description_column = _find_dataframe_column(
+        additional_info_df,
+        *ADDITIONAL_INFO_DESCRIPTION_COLUMNS,
+    )
+    if description_column is None:
+        for column in additional_info_df.columns:
+            if "description" in cell_text(column).casefold():
+                description_column = str(column)
+                break
+    equipment_column = _find_dataframe_column(additional_info_df, "Equipment Type")
+    currency_column = _find_dataframe_column(
+        additional_info_df,
+        SERVICE_FEE_CURRENCY_COLUMN,
+        "Currency",
+    )
+    section_column = _find_dataframe_column(additional_info_df, "Section Title")
+
+    used_names: set[str] = set()
+    costs: list[tuple[str, float | int, str, str, str]] = []
+
+    for _, row in additional_info_df.iterrows():
+        rate = rate_value(row.get(rate_column))
+        if rate is None:
+            continue
+
+        base_name = _additional_info_accessorial_name(
+            row,
+            description_column=description_column,
+            rate_column=rate_column,
+        )
+        if not base_name:
+            continue
+
+        currency = "USD"
+        if currency_column:
+            currency = cell_text(row.get(currency_column)).upper() or "USD"
+
+        section_title = cell_text(row.get(section_column)) if section_column else ""
+        apply_if = _additional_info_accessorial_apply_if(row, section_title)
+
+        equipment_text = cell_text(row.get(equipment_column)) if equipment_column else ""
+        container_codes = _container_codes_from_equipment_text(equipment_text)
+
+        if container_codes:
+            for container_code in container_codes:
+                split_name = _ensure_unique_column_name(
+                    f"{base_name} (Container/{container_code})",
+                    used_names,
+                )
+                costs.append(
+                    (
+                        split_name,
+                        rate,
+                        currency,
+                        apply_if,
+                        rate_by_for_container_code(container_code),
+                    )
+                )
+            continue
+
+        column_name = _ensure_unique_column_name(base_name, used_names)
+        costs.append((column_name, rate, currency, apply_if, "Rate by:\nRegular rule"))
+
+    return costs
+
+
+def _build_accessorial_costs_from_items(
+    resolved_rows: list[dict[str, object]],
+    charge_counts: dict[str, int],
+) -> list[tuple[str, float | int, str, str, str]]:
+    if not resolved_rows:
+        return []
+
+    used_names: set[str] = set()
+    costs: list[tuple[str, float | int, str, str, str]] = []
+
+    for item in resolved_rows:
+        row = item["row"]
+        charge = cell_text(item.get("charge"))
+        accessorial = cell_text(item.get("accessorial"))
+        origins = cell_text(item.get("origins"))
+        rate = rate_value(row.get(SERVICE_FEE_RATE_COLUMN))
+        currency = cell_text(row.get(SERVICE_FEE_CURRENCY_COLUMN)).upper() or "USD"
+        rate_basis = cell_text(row.get(SERVICE_FEE_RATE_BASIS_COLUMN))
+
+        column_name = service_fee_column_name(
+            charge,
+            accessorial,
+            origins,
+            charge_has_duplicates=charge_counts.get(charge, 0) > 1,
+        )
+        if not column_name or rate is None:
+            continue
+
+        container_codes = split_rate_basis_container_codes(rate_basis)
+        if len(container_codes) > 1:
+            for container_code in container_codes:
+                split_name = _ensure_unique_column_name(
+                    f"{column_name} (Container/{container_code})",
+                    used_names,
+                )
+                costs.append(
+                    (
+                        split_name,
+                        rate,
+                        currency,
+                        accessorial_apply_if(split_name),
+                        rate_by_for_container_code(container_code),
+                    )
+                )
+            continue
+
+        column_name = _ensure_unique_column_name(column_name, used_names)
+        costs.append(
+            (
+                column_name,
+                rate,
+                currency,
+                accessorial_apply_if(column_name),
+                accessorial_rate_by(charge, accessorial, rate_basis),
+            )
+        )
+
+    return costs
 
 
 def _is_equipment_type_accessorial(accessorial: str) -> bool:
@@ -870,62 +1289,24 @@ def extract_approved_service_fees(service_fees_df: pd.DataFrame) -> list[tuple[s
 
 
 def extract_accessorial_costs(
-    service_fees_df: pd.DataFrame,
+    service_fees_df: pd.DataFrame | None = None,
+    *,
+    additional_info_df: pd.DataFrame | None = None,
 ) -> list[tuple[str, float | int, str, str, str]]:
     """Return (name, price, currency, apply_if, rate_by) for the Accessorial costs tab."""
-    resolved_rows, charge_counts = _collect_resolved_service_fee_items(service_fees_df)
-    if not resolved_rows:
-        return []
+    resolved_rows: list[dict[str, object]] = []
+    charge_counts: dict[str, int] = {}
 
-    used_names: set[str] = set()
-    costs: list[tuple[str, float | int, str, str, str]] = []
+    if service_fees_df is not None and not service_fees_df.empty:
+        fee_rows, fee_counts = _collect_resolved_service_fee_items(service_fees_df)
+        resolved_rows.extend(fee_rows)
+        for charge, count in fee_counts.items():
+            charge_counts[charge] = charge_counts.get(charge, 0) + count
 
-    for item in resolved_rows:
-        row = item["row"]
-        charge = cell_text(item.get("charge"))
-        accessorial = cell_text(item.get("accessorial"))
-        origins = cell_text(item.get("origins"))
-        rate = rate_value(row.get(SERVICE_FEE_RATE_COLUMN))
-        currency = cell_text(row.get(SERVICE_FEE_CURRENCY_COLUMN)).upper()
-        rate_basis = cell_text(row.get(SERVICE_FEE_RATE_BASIS_COLUMN))
+    costs = _build_accessorial_costs_from_items(resolved_rows, charge_counts)
 
-        column_name = service_fee_column_name(
-            charge,
-            accessorial,
-            origins,
-            charge_has_duplicates=charge_counts.get(charge, 0) > 1,
-        )
-        if not column_name or rate is None:
-            continue
-
-        container_codes = split_rate_basis_container_codes(rate_basis)
-        if len(container_codes) > 1:
-            for container_code in container_codes:
-                split_name = _ensure_unique_column_name(
-                    f"{column_name} (Container/{container_code})",
-                    used_names,
-                )
-                costs.append(
-                    (
-                        split_name,
-                        rate,
-                        currency,
-                        accessorial_apply_if(split_name),
-                        rate_by_for_container_code(container_code),
-                    )
-                )
-            continue
-
-        column_name = _ensure_unique_column_name(column_name, used_names)
-        costs.append(
-            (
-                column_name,
-                rate,
-                currency,
-                accessorial_apply_if(column_name),
-                accessorial_rate_by(charge, accessorial, rate_basis),
-            )
-        )
+    if additional_info_df is not None and not additional_info_df.empty:
+        costs.extend(_build_additional_info_accessorial_costs(additional_info_df))
 
     return costs
 
@@ -1085,6 +1466,7 @@ def build_shipment_and_cost_rows(
     rate_tabs: list[tuple[str, pd.DataFrame]],
     *,
     include_origin_city: bool = False,
+    fb_service_type_mode: str | None = None,
 ) -> pd.DataFrame:
     set_include_origin_city(include_origin_city)
     transport_cost_columns = collect_transport_cost_columns(rate_tabs)
@@ -1096,18 +1478,22 @@ def build_shipment_and_cost_rows(
         port_of_entry = _column_or_blank(source_df, "Port of Entry")
         destination_city = _column_or_blank(source_df, "Destination City")
         origin_city = _column_or_blank(source_df, ORIGIN_CITY_RAW_COLUMN)
-        value_columns = find_value_columns(source_df)
-        use_validity = len(value_columns) > 1
+        value_groups = find_value_column_groups(source_df)
+        use_validity = len(value_groups) > 1
 
         for row_idx, source_row in source_df.iterrows():
             lane_number += 1
             equipment = source_row.get("Equipment Type")
             expanded_equipment = expand_equipment_types(equipment)
 
+            service_type = cell_text(source_row.get("Service Type"))
+            if fb_service_type_mode and is_fb_service_type_tab(tab_name):
+                service_type = apply_fb_service_type(service_type, fb_service_type_mode)
+
             matrix_row: dict[str, object] = {
                 "Lane #": lane_number,
                 "Tab": tab_name,
-                "Service Type": cell_text(source_row.get("Service Type")),
+                "Service Type": service_type,
                 "Origin Country": cell_text(source_row.get("Origin Country")),
                 "Port of Loading": cell_text(port_of_loading.loc[row_idx]),
                 "Port of Loading ": cell_text(port_of_loading.loc[row_idx]),
@@ -1128,20 +1514,33 @@ def build_shipment_and_cost_rows(
                 for cost_column in group.cost_columns:
                     matrix_row[cost_column] = None
 
-            if not value_columns:
+            if not value_groups:
                 for equipment_type in expanded_equipment:
                     matrix_row[transport_cost_name(equipment_type)] = None
             else:
-                ordered_value_columns = (
-                    sort_value_columns_by_validity(source_df, value_columns)
-                    if use_validity
-                    else value_columns
-                )
-                for value_column, currency_code in ordered_value_columns:
-                    validity_label = (
-                        validity_label_from_row(source_row, value_column) if use_validity else ""
+                ordered_value_groups = (
+                    sorted(
+                        value_groups,
+                        key=lambda group: (
+                            parse_validity_label_start(
+                                validity_label_for_value_column(source_df, group.validity_column)
+                            ),
+                            validity_label_for_value_column(source_df, group.validity_column),
+                            group.validity_column or "",
+                        ),
                     )
-                    rate_amount = rate_value(source_row.get(value_column))
+                    if use_validity
+                    else value_groups
+                )
+                for group in ordered_value_groups:
+                    validity_column = group.validity_column
+                    if not validity_column:
+                        continue
+                    currency_code = group.currency
+                    validity_label = (
+                        validity_label_from_row(source_row, validity_column) if use_validity else ""
+                    )
+                    rate_amount = group.rate_from_row(source_row)
                     currency_column = currency_column_name(validity_label)
                     if rate_amount is not None:
                         matrix_row[currency_column] = currency_code
@@ -1591,7 +1990,18 @@ def run_build_matrix(
     if include_origin_city:
         print("  Origin City shipment columns enabled")
 
-    matrix_df = build_shipment_and_cost_rows(rate_tabs, include_origin_city=include_origin_city)
+    fb_service_type_mode: str | None = None
+    fb_tabs = [tab_name for tab_name, _ in rate_tabs if is_fb_service_type_tab(tab_name)]
+    if fb_tabs:
+        fb_service_type_mode = prompt_fb_service_type(auto=auto, tab_names=fb_tabs)
+        action = "FB- prefix" if fb_service_type_mode == "add" else "replace first 2 letters with FB"
+        print(f"  FB Service Type mode for {len(fb_tabs)} tab(s): {action}")
+
+    matrix_df = build_shipment_and_cost_rows(
+        rate_tabs,
+        include_origin_city=include_origin_city,
+        fb_service_type_mode=fb_service_type_mode,
+    )
     source_lane_count = count_source_lane_rows(rate_tabs)
     if source_lane_count != len(matrix_df):
         print(
@@ -1604,7 +2014,17 @@ def run_build_matrix(
         print(f"  Highlighting {len(duplicate_indices)} duplicate lane row(s) in yellow")
 
     service_fees_df = load_service_fees_tab(file_path)
-    accessorial_costs = extract_accessorial_costs(service_fees_df) if service_fees_df is not None else []
+    try:
+        from build_postal_code_zones import load_additional_info
+
+        additional_info_df = load_additional_info(file_path)
+    except RuntimeError:
+        additional_info_df = None
+
+    accessorial_costs = extract_accessorial_costs(
+        service_fees_df,
+        additional_info_df=additional_info_df,
+    )
     matrix_df, service_fee_rate_by, service_fee_currencies, service_fees = append_special_lane(
         matrix_df,
         service_fees_df,
