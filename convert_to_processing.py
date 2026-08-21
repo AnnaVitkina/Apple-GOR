@@ -35,7 +35,10 @@ HEADER_MARKERS = (
 )
 
 SECTION_TITLE_PATTERN = re.compile(r"gor25\s+.+\s+common\s+rating", re.IGNORECASE)
-VALUE_HEADER_PATTERN = re.compile(r"^Value\s*\(([^)]+)\)\s*$", re.IGNORECASE)
+VALUE_HEADER_PATTERN = re.compile(
+    r"^Value\s*\(([^)]+)\)(?:\s+Grand\s+Total)?\s*$",
+    re.IGNORECASE,
+)
 VALID_FROM_COLUMN = "Valid From"
 VALID_TO_COLUMN = "Valid To"
 
@@ -401,7 +404,10 @@ def _apply_internal_value_headers(headers: list[str], internal_row: pd.Series) -
 
 def _is_value_header_name(header_name: str) -> bool:
     text = _cell_text(header_name)
-    return bool(VALUE_HEADER_PATTERN.match(text) or re.match(r"^Value\s*\([^)]+\)_\d+$", text, re.I))
+    return bool(
+        VALUE_HEADER_PATTERN.match(text)
+        or re.match(r"^Value\s*\([^)]+\)(?:\s+Grand\s+Total)?_\d+$", text, re.IGNORECASE)
+    )
 
 
 def _attach_per_value_column_validity(
