@@ -164,8 +164,8 @@ DATA_START_ROW = 6
 ACCESSORIAL_COSTS_SHEET_NAME = "Accessorial costs"
 ACCESSORIAL_COSTS_COLUMNS = (
     "Name",
-    "Price",
     "Currency",
+    "Price",
     "Apply if",
     "Rate by",
 )
@@ -1388,14 +1388,14 @@ def write_accessorial_costs_sheet(
         name_cell.alignment = LEFT
         name_cell.border = THIN_BORDER
 
-        price_cell = worksheet.cell(excel_row, 2, price)
+        currency_cell = worksheet.cell(excel_row, 2, currency)
+        currency_cell.alignment = CENTER
+        currency_cell.border = THIN_BORDER
+
+        price_cell = worksheet.cell(excel_row, 3, price)
         price_cell.number_format = RATE_NUMBER_FORMAT
         price_cell.alignment = CENTER
         price_cell.border = THIN_BORDER
-
-        currency_cell = worksheet.cell(excel_row, 3, currency)
-        currency_cell.alignment = CENTER
-        currency_cell.border = THIN_BORDER
 
         apply_if_cell = worksheet.cell(excel_row, 4, apply_if)
         apply_if_cell.alignment = LEFT
