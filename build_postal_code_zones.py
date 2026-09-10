@@ -7,6 +7,7 @@ Output columns (tab-separated):
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,6 +41,26 @@ DESTINATION_LABEL_COLUMN = "Destination City "
 DESTINATION_LABEL_SUFFIX = " (Destination)"
 ORIGIN_LABEL_SUFFIX = " (Origin)"
 
+# Alternate spellings that share a common-rating group key (e.g. source typo "Hinkley").
+COMMON_RATING_GROUP_ALIASES: dict[str, str] = {
+    "hinkley": "hinckley",
+}
+
+# Preferred display name for a common-rating group key.
+PREFERRED_CITY_DISPLAY: dict[str, str] = {
+    "hinckley": "Hinckley",
+}
+
+# Extra postal-code spellings to include alongside the canonical city name.
+POSTAL_SPELLING_ALIASES: dict[str, tuple[str, ...]] = {
+    "strancice": ("Strančice",),
+}
+
+VIA_RTM_CITY_PATTERN = re.compile(r"^(.+?)\s+via\s+RTM\s*$", re.IGNORECASE)
+CITY_FIELD_SPLIT_PATTERN = re.compile(r"\s*/\s*")
+PAREN_CITY_SEGMENT_PATTERN = re.compile(r"\(([^)]*)\)")
+PROVINCE_SEGMENT_PATTERN = re.compile(r"\bprovince\b", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class PostalCodeZone:
@@ -62,6 +83,82 @@ def _city_group_key(city: str) -> str:
     return _ascii_fold(city).casefold().replace(" ", "")
 
 
+def _common_rating_group_key(city: str) -> str:
+    key = _city_group_key(city)
+    return COMMON_RATING_GROUP_ALIASES.get(key, key)
+
+
+def _preferred_zone_display_name(city: str) -> str:
+    preferred = PREFERRED_CITY_DISPLAY.get(_common_rating_group_key(city))
+    if preferred:
+        return preferred
+    return _zone_display_name(city)
+
+
+def _split_city_field(city: str) -> list[str]:
+    text = cell_text(city)
+    if not text:
+        return []
+    parts = [part.strip() for part in CITY_FIELD_SPLIT_PATTERN.split(text) if part.strip()]
+    return parts or [text]
+
+
+def _expand_paren_city_names(city: str) -> list[str]:
+    """Split a city label with parenthetical alternates into separate postal names."""
+    text = cell_text(city)
+    if not text:
+        return []
+
+    segments: list[str] = []
+    base = re.split(r"\s*\(", text, maxsplit=1)[0].strip()
+    if base:
+        segments.append(base)
+
+    for match in PAREN_CITY_SEGMENT_PATTERN.finditer(text):
+        inner = match.group(1).strip().rstrip(",").strip()
+        if not inner or PROVINCE_SEGMENT_PATTERN.search(inner):
+            continue
+        segments.append(inner)
+
+    return segments or [text]
+
+
+def _city_field_postal_segments(city: str) -> list[str]:
+    segments: list[str] = []
+    for part in _split_city_field(city):
+        segments.extend(_expand_paren_city_names(part))
+    return segments
+
+
+def _postal_code_values_for_city(
+    city: str,
+    *,
+    country: str,
+    common_rating_city: str,
+) -> list[str]:
+    values: list[str] = []
+    for segment in _city_field_postal_segments(city):
+        compact = _postal_code_value(segment, country, common_rating_city)
+        if compact:
+            values.append(compact)
+    return values
+
+
+def _expand_postal_spelling_aliases(cities: list[str]) -> list[str]:
+    expanded = list(cities)
+    for city in cities:
+        for alias in POSTAL_SPELLING_ALIASES.get(_city_group_key(city), ()):
+            expanded.append(alias)
+    return _unique_postal_values(expanded)
+
+
+def _postal_code_base_city(city: str) -> str:
+    match = VIA_RTM_CITY_PATTERN.match(cell_text(city))
+    if match:
+        return match.group(1).strip()
+    return cell_text(city)
+
+
 def _zone_display_name(city: str) -> str:
     """ASCII-fold diacritics for zone names; keep spaces."""
     return _ascii_fold(city).strip()
@@ -76,7 +173,17 @@ def _compact_postal_city(city: str) -> str:
     return "".join(part[:1].upper() + part[1:] for part in parts)
 
 
+def _postal_city_display(city: str) -> str:
+    text = _postal_code_base_city(city)
+    preferred = PREFERRED_CITY_DISPLAY.get(_common_rating_group_key(text))
+    if preferred:
+        return preferred
+    return text
+
+
 def _postal_code_value(city: str, country: str, common_rating_city: str) -> str:
+    city = _postal_city_display(city)
+    common_rating_city = _postal_city_display(common_rating_city)
     if country in {"US", "CA"}:
         formatted = format_us_ca_postal_city(city, country, common_rating_city)
         if "_" in formatted:
@@ -86,7 +193,7 @@ def _postal_code_value(city: str, country: str, common_rating_city: str) -> str:
 
 
 def _format_zone_name(city: str, suffix: str) -> str:
-    return f"{_zone_display_name(city)} ({suffix})"
+    return f"{_preferred_zone_display_name(city)} ({suffix})"
 
 
 def _zone_match_key(label: str) -> str:
@@ -94,16 +201,16 @@ def _zone_match_key(label: str) -> str:
     for suffix in (DESTINATION_LABEL_SUFFIX, ORIGIN_LABEL_SUFFIX):
         if text.endswith(suffix):
             base_city = text[: -len(suffix)].strip()
-            return f"{_city_group_key(base_city)}|{suffix.casefold()}"
-    return _city_group_key(text)
+            return f"{_common_rating_group_key(base_city)}|{suffix.casefold()}"
+    return _common_rating_group_key(text)
 
 
 def _normalize_zone_label(label: str) -> str:
     for suffix in (DESTINATION_LABEL_SUFFIX, ORIGIN_LABEL_SUFFIX):
         if label.endswith(suffix):
             base_city = label[: -len(suffix)].strip()
-            return f"{_zone_display_name(base_city)}{suffix}"
-    return _zone_display_name(label)
+            return f"{_preferred_zone_display_name(base_city)}{suffix}"
+    return _preferred_zone_display_name(label)
 
 
 def load_additional_info(file_path: Path) -> pd.DataFrame:
@@ -172,13 +279,13 @@ def _build_zones_from_section(
         if not common_rating_city or not country or not city:
             continue
 
-        group_key = (_city_group_key(common_rating_city), country)
+        group_key = (_common_rating_group_key(common_rating_city), country)
         bucket = grouped.setdefault(
             group_key,
             {"display_city": common_rating_city, "common_rating_variants": set(), "cities": []},
         )
         bucket["common_rating_variants"].add(common_rating_city)
-        bucket["cities"].append(city)
+        bucket["cities"].extend(_split_city_field(city))
 
     zones: list[PostalCodeZone] = []
     for (_city_key, country), bucket in grouped.items():
@@ -187,8 +294,12 @@ def _build_zones_from_section(
         unique_cities = _unique_preserve_order(cities)
         rating_variants = _unique_preserve_order(list(bucket["common_rating_variants"]))
         postal_cities = _unique_postal_values([display_city, *rating_variants, *unique_cities])
+        postal_cities = _expand_postal_spelling_aliases(postal_cities)
+        postal_segments: list[str] = []
+        for city in postal_cities:
+            postal_segments.extend(_city_field_postal_segments(city))
         postal_values = [
-            _postal_code_value(city, country, display_city) for city in postal_cities
+            _postal_code_value(segment, country, display_city) for segment in postal_segments
         ]
         postal_values = _unique_preserve_order(postal_values)
         zones.append(
@@ -291,11 +402,15 @@ def _merge_postal_code_values(
     merged = [part.strip() for part in postal_code.split(",") if part.strip()]
     seen = {value.casefold() for value in merged}
     for city in extra_cities:
-        compact = _postal_code_value(city, country, common_rating_city)
-        if compact.casefold() in seen:
-            continue
-        merged.append(compact)
-        seen.add(compact.casefold())
+        for compact in _postal_code_values_for_city(
+            city,
+            country=country,
+            common_rating_city=common_rating_city,
+        ):
+            if compact.casefold() in seen:
+                continue
+            merged.append(compact)
+            seen.add(compact.casefold())
     return ", ".join(merged)
 
 
